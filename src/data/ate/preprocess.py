@@ -3,11 +3,15 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 from .data_class import PVTrainDataSet, PVTestDataSet
+from .data_class_mar import PVTrainDataSetMAR
 
 
 class AbstractPreprocessor:
 
     def preprocess_for_train(self, train_data: PVTrainDataSet, **kwarg) -> PVTrainDataSet:
+        raise NotImplementedError
+    
+    def preprocess_for_train_mar(self, train_data: PVTrainDataSetMAR, **kwarg) -> PVTrainDataSetMAR:
         raise NotImplementedError
 
     def preprocess_for_test_input(self, test_data: PVTestDataSet) -> PVTestDataSet:
@@ -23,6 +27,16 @@ class IdentityPreprocessor(AbstractPreprocessor):
         super(IdentityPreprocessor, self).__init__()
 
     def preprocess_for_train(self, train_data: PVTrainDataSet, **kwarg) -> PVTrainDataSet:
+        return train_data
+
+    def preprocess_for_train_mar(self, train_data: PVTrainDataSetMAR, **kwarg) -> PVTrainDataSetMAR:
+        """
+        No-op preprocessing for MAR datasets.
+
+        Mirrors `preprocess_for_train` but keeps the MAR-specific `delta_w`
+        field intact. This is the natural analogue of the Identity preprocessor
+        for fully observed data.
+        """
         return train_data
 
     def preprocess_for_test_input(self, test_data: PVTestDataSet) -> PVTestDataSet:
