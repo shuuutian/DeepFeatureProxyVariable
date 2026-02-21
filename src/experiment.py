@@ -4,11 +4,13 @@ import os
 import numpy as np
 from joblib import Parallel, delayed
 import logging
+import json
+import datetime
 
 from src.utils import grid_search_dict
-from src.models.kernelPV.model import kpv_experiments
-from src.models.DFPV.trainer import dfpv_experiments
-from src.models.DFPV.trainer_mar import dfpv_experiments_mar
+
+from src.models.DFPV.trainer import dfpv_experiments, dfpv_experiments_mar_naive
+from src.models.DFPV.trainer_mar import dfpv_experiments_mar_modified
 from src.models.PMMR.model import pmmr_experiments
 from src.models.CEVAE.trainer import cevae_experiments
 
@@ -17,11 +19,14 @@ logger = logging.getLogger()
 
 def get_run_func(mdl_name: str):
     if mdl_name == "kpv":
+        from src.models.kernelPV.model import kpv_experiments
         return kpv_experiments
     elif mdl_name == "dfpv":
         return dfpv_experiments
-    elif mdl_name == "dfpv_mar":
-        return dfpv_experiments_mar
+    elif mdl_name == "dfpv_mar_naive":
+        return dfpv_experiments_mar_naive
+    elif mdl_name == "dfpv_mar_modified":
+        return dfpv_experiments_mar_modified
     elif mdl_name == "pmmr":
         return pmmr_experiments
     elif mdl_name == "cevae":
@@ -58,3 +63,17 @@ def experiments(configs: Dict[str, Any],
             print(res)
             np.savetxt(one_mdl_dump_dir.joinpath("result.csv"), np.array(res))
         logger.critical(f"{dump_name} ended")
+
+if __name__ == "__main__":
+    config_path = Path.cwd().joinpath("configs/dfpv_mar.json")
+    with config_path.open("r") as f:
+        config = json.load(f)
+
+    dump_root = Path.cwd().joinpath("dumps")
+    os.makedirs(dump_root, exist_ok=True)
+    test_dump_dir = dump_root.joinpath(
+        f"experiment_test_dfpv_mar_{datetime.datetime.now().strftime('%m-%d-%H-%M-%S')}"
+    )
+    os.mkdir(test_dump_dir)
+
+    experiments(config, test_dump_dir, num_cpus=1, num_gpu=None)

@@ -9,7 +9,7 @@ import numpy as np
 
 from src.models.DFPV.nn_structure import build_extractor
 from src.models.DFPV.model import DFPVModel
-from src.data.ate import generate_train_data_ate, generate_test_data_ate, get_preprocessor_ate
+from src.data.ate import generate_train_data_ate, generate_test_data_ate, generate_train_data_ate_mar, get_preprocessor_ate
 from src.data.ate.data_class import PVTrainDataSetTorch, PVTestDataSetTorch, split_train_data, PVTrainDataSet, \
     PVTestDataSet
 from src.utils.pytorch_linear_reg_utils import linear_reg_loss
@@ -218,5 +218,52 @@ def dfpv_experiments(data_config: Dict[str, Any], model_param: Dict[str, Any],
         oos_loss: float = np.mean((pred - test_data_org.structural) ** 2)
         if data_config["name"] in ["kpv", "deaner"]:
             oos_loss = np.mean(np.abs(pred - test_data_org.structural))
+    np.savetxt(one_mdl_dump_dir.joinpath(f"{random_seed}.pred.txt"), pred)
+    return oos_loss
+
+def dfpv_experiments_mar_naive(
+    data_config: Dict[str, Any],
+    model_param: Dict[str, Any],
+    one_mdl_dump_dir: Path,
+    random_seed: int = 42,
+    verbose: int = 0,
+) -> float:
+    dump_dir = one_mdl_dump_dir.joinpath(f"{random_seed}")
+    train_data_org_mar = generate_train_data_ate_mar(data_config=data_config, rand_seed=random_seed)
+    test_data_org = generate_test_data_ate(data_config=data_config)
+
+    observed_mask = train_data_org_mar.delta_w.reshape(-1) > 0.5
+    if not np.any(observed_mask):
+        raise ValueError("No observed outcome_proxy rows available (all delta_w are 0).")
+
+    train_data_org = PVTrainDataSet(
+        treatment=train_data_org_mar.treatment[observed_mask],
+        treatment_proxy=train_data_org_mar.treatment_proxy[observed_mask],
+        outcome_proxy=train_data_org_mar.outcome_proxy[observed_mask],
+        outcome=train_data_org_mar.outcome[observed_mask],
+        backdoor=train_data_org_mar.backdoor[observed_mask] if train_data_org_mar.backdoor is not None else None,
+    )
+
+    preprocessor = get_preprocessor_ate(data_config.get("preprocess", "Identity"))
+    train_data = preprocessor.preprocess_for_train(train_data_org)
+    test_data = preprocessor.preprocess_for_test_input(test_data_org)
+
+    torch.manual_seed(random_seed)
+    trainer = DFPVTrainer(data_config, model_param, False, dump_dir)
+    mdl = trainer.train(train_data, verbose)
+
+    test_data_t = PVTestDataSetTorch.from_numpy(test_data)
+    if trainer.gpu_flg:
+        torch.cuda.empty_cache()
+        test_data_t = test_data_t.to_gpu()
+
+    pred: np.ndarray = mdl.predict_t(test_data_t.treatment).data.cpu().numpy()
+    pred = preprocessor.postprocess_for_prediction(pred)
+    oos_loss = 0.0
+    if test_data.structural is not None:
+        oos_loss = np.mean((pred - test_data_org.structural) ** 2)
+        if data_config["name"] in ["kpv", "deaner"]:
+            oos_loss = np.mean(np.abs(pred - test_data_org.structural))
+
     np.savetxt(one_mdl_dump_dir.joinpath(f"{random_seed}.pred.txt"), pred)
     return oos_loss

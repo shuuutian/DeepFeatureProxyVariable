@@ -1,0 +1,22 @@
+{
+    "n_repeat": 30,
+    "data": {
+        "name": "demand",
+        "n_sample": 100,
+        "missing_rate": 0.3,
+        "preprocess": "Identity"
+    },
+    "model": {
+        "name": "dfpv_mar_naive",
+        "lam1": 0.1,
+        "lam2": 0.1,
+        "stage1_iter": 20,
+        "stage2_iter": 1,
+        "n_epoch": 100,
+        "split_ratio": 0.5,
+        "treatment_weight_decay": 0.1,
+        "treatment_proxy_weight_decay": 0.1,
+        "outcome_proxy_weight_decay": 0.1,
+        "backdoor_weight_decay": 0.0
+    }
+}
