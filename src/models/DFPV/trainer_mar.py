@@ -144,8 +144,8 @@ class DFPVTrainerMAR:
             if verbose >= 1:
                 logger.info(f"Epoch {t} ended")
 
-        # Final fit on all data with last nuisance state
-        self._fit_nuisance_models(train_data_t)
+        # Final fit on all data — no reset, warm-start from last epoch's weights
+        self._fit_nuisance_models(train_data_t, reset=False)
         phi_dr_full = self._compute_dr_pseudo_outcome(train_data_t, verbose)
 
         mdl = DFPVModelMAR(
@@ -187,13 +187,23 @@ class DFPVTrainerMAR:
             gpu_flg=self.gpu_flg,
         )
 
-    def _fit_nuisance_models(self, train_fold: PVTrainDataSetMARTorch):
+    def _fit_nuisance_models(self, train_fold: PVTrainDataSetMARTorch, reset: bool = True):
         """Fit propensity and imputation on the given data split.
 
         Propensity: trained on ALL samples in fold using L+=(A,Z,X,Y)
         Imputation: trained on complete cases (delta_w=1) using L=(A,Z,X)
                     with targets psi_{θ_W}(W_i) from frozen outcome_proxy_net
+
+        Args:
+            train_fold: data to fit on (I_{-k} during epoch loop, full data for final fit)
+            reset:      if True, re-initialise nuisance networks before fitting.
+                        Must be True during the epoch loop (Algorithm 5.1: each fold is an
+                        independent fit on I_{-k}).  Set to False for the final all-data fit
+                        so that the nuisance networks warm-start from their last state.
         """
+        if reset:
+            self.nuisance_models.reset_weights()
+
         L = construct_L(
             train_fold.treatment,
             train_fold.treatment_proxy,

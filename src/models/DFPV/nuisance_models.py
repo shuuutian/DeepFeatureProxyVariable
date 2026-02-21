@@ -27,6 +27,14 @@ class NuisanceModels:
     ):
         self.gpu_flg = gpu_flg
 
+        # Store architecture args so reset_weights() can rebuild identical networks
+        self._dim_L_plus = dim_L_plus
+        self._dim_L = dim_L
+        self._dim_psi_w = dim_psi_w
+        self._hidden_dim = hidden_dim
+        self._n_layers = n_layers
+        self._dropout = dropout
+
         self.propensity_net = self._build_classifier(dim_L_plus, hidden_dim, n_layers, dropout)
         self.imputation_net = self._build_regressor(dim_L, dim_psi_w, hidden_dim, n_layers, dropout)
 
@@ -129,6 +137,26 @@ class NuisanceModels:
         self.imputation_net.train(False)
         with torch.no_grad():
             return self.imputation_net(L)
+
+    def reset_weights(self):
+        """Re-initialise nuisance networks and optimisers from scratch.
+
+        Required by Algorithm 5.1 (thesis): each fold's nuisance models must be
+        trained independently on I_{-k} without any information carried over from
+        previous folds or epochs.  Calling this before each fold's fit ensures the
+        cross-fitting independence guarantee is satisfied.
+        """
+        device = next(self.propensity_net.parameters()).device
+
+        self.propensity_net = self._build_classifier(
+            self._dim_L_plus, self._hidden_dim, self._n_layers, self._dropout
+        ).to(device)
+        self.imputation_net = self._build_regressor(
+            self._dim_L, self._dim_psi_w, self._hidden_dim, self._n_layers, self._dropout
+        ).to(device)
+
+        self.propensity_opt = torch.optim.Adam(self.propensity_net.parameters(), lr=1e-3)
+        self.imputation_opt = torch.optim.Adam(self.imputation_net.parameters(), lr=1e-3)
 
     def clone_weights(self) -> "NuisanceModels":
         """Return a deep copy of current nuisance model weights (for saving fold estimates)."""
