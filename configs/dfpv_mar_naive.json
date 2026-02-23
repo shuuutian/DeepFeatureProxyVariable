@@ -1,8 +1,8 @@
 {
-    "n_repeat": 30,
+    "n_repeat": 500,
     "data": {
         "name": "demand",
-        "n_sample": 100,
+        "n_sample": 1000,
         "missing_rate": 0.3,
         "preprocess": "Identity"
     },

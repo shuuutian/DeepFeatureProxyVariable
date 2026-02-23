@@ -1,8 +1,8 @@
 {
-    "n_repeat": 30,
+    "n_repeat": 100,
     "data": {
         "name": "demand",
-        "n_sample": 100,
+        "n_sample": 1000,
         "missing_rate": 0.3,
         "preprocess": "Identity"
     },
@@ -12,8 +12,8 @@
         "lam2": 0.1,
         "stage1_iter": 20,
         "stage2_iter": 1,
-        "n_epoch": 100,
-        "n_folds": 3,
+        "n_epoch": 20,
+        "n_folds": 10,
         "nuisance_n_epochs": 50,
         "propensity_clip": 0.001,
         "split_ratio": 0.5,

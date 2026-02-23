@@ -45,3 +45,7 @@ def generate_test_demand_pv():
     treatment = np.array([cal_structural(p) for p in price])
     return PVTestDataSet(structural=treatment[:, np.newaxis],
                          treatment=price[:, np.newaxis])
+
+if __name__ == '__main__':
+    test = generate_test_demand_pv()
+    print(test)

@@ -78,9 +78,10 @@ def generate_train_data_ate_mar(data_config: Dict[str, Any], rand_seed: int) -> 
         parts.append(base_data.backdoor)
     L_plus = np.concatenate(parts, axis=1)  # (n, d_L+)
 
-    # Logistic MAR: linear score on standardised L+
+    # Logistic MAR: linear score on standardised L+ with fixed coefficients
     L_std = (L_plus - L_plus.mean(axis=0)) / (L_plus.std(axis=0) + 1e-8)
-    alpha = rng.standard_normal(L_std.shape[1]) * 0.3  # small random coefficients
+    mar_alpha_value: float = data_config.get("mar_alpha_value", 1.6)
+    alpha = np.full(L_std.shape[1], mar_alpha_value, dtype=np.float64)
     score = L_std @ alpha  # (n,)
 
     # Calibrate intercept alpha_0 to achieve target missing_rate

@@ -70,25 +70,31 @@ class NuisanceModels:
         L_plus: torch.Tensor,
         delta_w: torch.Tensor,
         n_epochs: int = 50,
-    ):
+    ) -> list:
         """Train propensity model on all samples.
 
         Args:
             L_plus:  (n, dim_L_plus) — concatenation of (A, Z, X, Y)
             delta_w: (n,) or (n,1)   — binary missingness indicator
             n_epochs: training epochs
+
+        Returns:
+            List of per-epoch BCE loss values.
         """
         if delta_w.dim() == 1:
             delta_w = delta_w.unsqueeze(1)
         bce = nn.BCELoss()
         self.propensity_net.train(True)
+        history = []
         for _ in range(n_epochs):
             self.propensity_opt.zero_grad()
             e_hat = self.propensity_net(L_plus)
             loss = bce(e_hat, delta_w)
             loss.backward()
             self.propensity_opt.step()
+            history.append(loss.item())
         self.propensity_net.train(False)
+        return history
 
     def fit_imputation(
         self,
@@ -96,7 +102,7 @@ class NuisanceModels:
         psi_w_targets: torch.Tensor,
         delta_w: torch.Tensor,
         n_epochs: int = 50,
-    ):
+    ) -> list:
         """Train imputation model on complete cases only.
 
         Args:
@@ -104,6 +110,9 @@ class NuisanceModels:
             psi_w_targets: (n, dim_psi_w) — ψ_{θ_W}(W_i); ignored where delta_w=0
             delta_w:       (n,) or (n,1)  — missingness indicator
             n_epochs: training epochs
+
+        Returns:
+            List of per-epoch MSE loss values (empty if no complete cases).
         """
         if delta_w.dim() > 1:
             delta_w_mask = delta_w.squeeze(1).bool()
@@ -114,17 +123,20 @@ class NuisanceModels:
         targets_obs = psi_w_targets[delta_w_mask]
 
         if L_obs.shape[0] == 0:
-            return  # no complete cases in this fold, skip
+            return []  # no complete cases in this fold, skip
 
         mse = nn.MSELoss()
         self.imputation_net.train(True)
+        history = []
         for _ in range(n_epochs):
             self.imputation_opt.zero_grad()
             m_hat = self.imputation_net(L_obs)
             loss = mse(m_hat, targets_obs)
             loss.backward()
             self.imputation_opt.step()
+            history.append(loss.item())
         self.imputation_net.train(False)
+        return history
 
     def predict_propensity(self, L_plus: torch.Tensor) -> torch.Tensor:
         """Return ê(L+) in (0,1). Shape: (n, 1)."""
