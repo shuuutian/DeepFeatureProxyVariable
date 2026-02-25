@@ -13,7 +13,7 @@ class DFPVModelMAR:
 
     Key differences from DFPVModel:
     - Stage 1 target is φ_DR (doubly robust pseudo-outcome), not ψ_W(W)
-    - θ_W (outcome_proxy_net) is NEVER updated — frozen at random init throughout
+    - θ_W (outcome_proxy_net) is pre-trained once then frozen during MAR fitting
     - Stage 2 uses μ̂(L) = V̂·(φ_A(A)⊗φ_Z(Z)⊗φ_X(X)) instead of ψ_W(W)
     - ATE prediction uses μ̂(a, Z_i, X_i) with A set to intervention value a
 
@@ -64,10 +64,10 @@ class DFPVModelMAR:
         """Two-stage least squares for modified DFPV.
 
         Stage 1: Regress φ_DR on (A,Z,X) features → solve for V̂
-        Stage 2: Regress Y on (A, μ̂(L), X) features → solve for û
+        Stage 2: Regress Y on (A, φ_DR, X) features → solve for û
 
-        phi_dr serves as both Stage-1 target AND as μ̂(L) input to Stage 2.
-        This is valid because phi_dr already is the best estimate of μ(L) = E[ψ_W(W)|L].
+        phi_dr serves as both Stage-1 target and Stage-2 proxy feature.
+        This keeps Stage-2 training consistent with prediction-time aggregation.
         """
         # Stage 1: fit V̂ by regressing phi_DR on (A,Z,X) features
         stage1_feature = DFPVModel.augment_stage1_feature(
@@ -78,12 +78,9 @@ class DFPVModelMAR:
         )
         stage1_weight = fit_linear(phi_dr, stage1_feature, lam1)
 
-        # Compute μ̂(L) = V̂ · stage1_feature  (thesis Eq. mu_hat_L)
-        mu_hat = linear_reg_pred(stage1_feature, stage1_weight)  # (n, d_W)
-
-        # Stage 2: regress Y on (ψ_{A(2)}(A) ⊗ μ̂(L) ⊗ φ_{X(2)}(X))
+        # Stage 2: regress Y on (ψ_{A(2)}(A) ⊗ φ_DR ⊗ φ_{X(2)}(X))
         stage2_feature = DFPVModel.augment_stage2_feature(
-            predicted_outcome_proxy_feature=mu_hat,
+            predicted_outcome_proxy_feature=phi_dr,
             treatment_feature=treatment_2nd_feature,
             backdoor_feature=backdoor_2nd_feature,
             add_stage2_intercept=add_stage2_intercept,
@@ -94,7 +91,6 @@ class DFPVModelMAR:
 
         return dict(
             stage1_weight=stage1_weight,
-            mu_hat=mu_hat,
             stage2_weight=stage2_weight,
             stage2_loss=stage2_loss,
         )

@@ -43,7 +43,7 @@ class DFPVTrainerMAR:
         Final fit on all data with final nuisance models.
 
     Key properties:
-    - outcome_proxy_net (θ_W) is NEVER updated — frozen at random initialization
+    - outcome_proxy_net (θ_W) is pre-trained on complete cases, then frozen
     - Nuisance imputation trained on L=(A,Z,X); propensity on L+=(A,Z,X,Y)
     """
 
@@ -66,13 +66,15 @@ class DFPVTrainerMAR:
         self.n_folds: int = train_params.get("n_folds", 5)
         self.nuisance_n_epochs: int = train_params.get("nuisance_n_epochs", 50)
         self.propensity_clip: float = train_params.get("propensity_clip", 1e-3)
+        self.outcome_proxy_pretrain_epochs: int = train_params.get("outcome_proxy_pretrain_epochs", 50)
+        self.outcome_proxy_pretrain_lr: float = train_params.get("outcome_proxy_pretrain_lr", 1e-3)
         self.add_stage1_intercept = True
         self.add_stage2_intercept = True
         self.treatment_weight_decay = train_params["treatment_weight_decay"]
         self.treatment_proxy_weight_decay = train_params["treatment_proxy_weight_decay"]
         self.backdoor_weight_decay = train_params["backdoor_weight_decay"]
 
-        # Build networks — outcome_proxy_net is kept frozen throughout
+        # Build networks — outcome_proxy_net will be pre-trained once, then frozen.
         networks = build_extractor(data_configs["name"])
         self.treatment_1st_net: nn.Module = networks[0]
         self.treatment_2nd_net: nn.Module = networks[1]
@@ -90,7 +92,7 @@ class DFPVTrainerMAR:
                 self.backdoor_1st_net.to("cuda:0")
                 self.backdoor_2nd_net.to("cuda:0")
 
-        # θ_W has no optimizer — it is intentionally never updated
+        # θ_W has no persistent optimizer — it is not updated during MAR loop.
         self.treatment_1st_opt = torch.optim.Adam(
             self.treatment_1st_net.parameters(), weight_decay=self.treatment_weight_decay
         )
@@ -124,6 +126,8 @@ class DFPVTrainerMAR:
         train_data_t = PVTrainDataSetMARTorch.from_numpy(train_data)
         if self.gpu_flg:
             train_data_t = train_data_t.to_gpu()
+
+        self._pretrain_and_freeze_outcome_proxy(train_data_t, verbose)
 
         # Initialise nuisance models now that we know input dimensions
         self.nuisance_models = self._init_nuisance_models(train_data_t)
@@ -165,6 +169,74 @@ class DFPVTrainerMAR:
         )
         mdl.fit_t(train_data_t, phi_dr_full, self.lam1, self.lam2)
         return mdl
+
+    def _pretrain_and_freeze_outcome_proxy(
+        self,
+        data: PVTrainDataSetMARTorch,
+        verbose: int = 0,
+    ):
+        """Pre-train θ_W on complete cases, then freeze it for MAR training.
+
+        Auxiliary objective: predict Y from [ψ_W(W), A, X] on rows with delta_w=1.
+        This removes the high-variance random-feature target for imputation while
+        preserving the MAR algorithm's frozen-θ_W requirement during cross-fitting.
+        """
+        if self.outcome_proxy_pretrain_epochs <= 0:
+            for p in self.outcome_proxy_net.parameters():
+                p.requires_grad_(False)
+            self.outcome_proxy_net.train(False)
+            return
+
+        if data.delta_w.dim() > 1:
+            obs_mask = data.delta_w.squeeze(1).bool()
+        else:
+            obs_mask = data.delta_w.bool()
+        n_obs = int(obs_mask.sum().item())
+        if n_obs == 0:
+            for p in self.outcome_proxy_net.parameters():
+                p.requires_grad_(False)
+            self.outcome_proxy_net.train(False)
+            return
+
+        device = next(self.outcome_proxy_net.parameters()).device
+        y_obs = data.outcome[obs_mask]
+        a_obs = data.treatment[obs_mask]
+        x_obs = data.backdoor[obs_mask] if data.backdoor is not None else None
+
+        with torch.no_grad():
+            psi_dim = self.outcome_proxy_net(data.outcome_proxy[obs_mask][:1]).shape[1]
+        head_in_dim = psi_dim + a_obs.shape[1] + (x_obs.shape[1] if x_obs is not None else 0)
+        head = nn.Linear(head_in_dim, y_obs.shape[1]).to(device)
+
+        params = list(self.outcome_proxy_net.parameters()) + list(head.parameters())
+        pretrain_opt = torch.optim.Adam(params, lr=self.outcome_proxy_pretrain_lr)
+        mse = nn.MSELoss()
+        self.outcome_proxy_net.train(True)
+        head.train(True)
+
+        for _ in range(self.outcome_proxy_pretrain_epochs):
+            pretrain_opt.zero_grad()
+            psi_obs = self.outcome_proxy_net(data.outcome_proxy[obs_mask])
+            feat_parts = [psi_obs, a_obs]
+            if x_obs is not None:
+                feat_parts.append(x_obs)
+            feat = torch.cat(feat_parts, dim=1)
+            y_hat = head(feat)
+            loss = mse(y_hat, y_obs)
+            loss.backward()
+            pretrain_opt.step()
+
+        if verbose >= 1:
+            logger.info(
+                "outcome_proxy pretrain complete: epochs=%d, observed=%d, final_loss=%.6f",
+                self.outcome_proxy_pretrain_epochs,
+                n_obs,
+                float(loss.detach().item()),
+            )
+
+        for p in self.outcome_proxy_net.parameters():
+            p.requires_grad_(False)
+        self.outcome_proxy_net.train(False)
 
     # ------------------------------------------------------------------
     # Nuisance fitting and DR pseudo-outcome
@@ -358,13 +430,12 @@ class DFPVTrainerMAR:
         phi_dr: torch.Tensor,
         verbose: int,
     ):
-        """Stage-2 gradient update using μ̂(L) = V̂·(stage-1 features) as proxy.
+        """Stage-2 gradient update using φ_DR directly as proxy.
 
         Updates: treatment_2nd_net, backdoor_2nd_net
         Frozen:  treatment_1st_net, treatment_proxy_net, outcome_proxy_net,
                  backdoor_1st_net
-        Note:    outcome_proxy_net (θ_W) is NEVER updated — critical difference
-                 from original DFPV.
+        Note:    outcome_proxy_net (θ_W) is pre-trained once, then kept frozen.
         """
         self.treatment_1st_net.train(False)
         self.treatment_2nd_net.train(True)
@@ -373,24 +444,6 @@ class DFPVTrainerMAR:
         if self.backdoor_1st_net is not None:
             self.backdoor_1st_net.train(False)
             self.backdoor_2nd_net.train(True)
-
-        # Stage-1 features are computed with no_grad (networks frozen for Stage 2)
-        with torch.no_grad():
-            treatment_1st_feature = self.treatment_1st_net(fold.treatment)
-            treatment_proxy_feature = self.treatment_proxy_net(fold.treatment_proxy)
-            backdoor_1st_feature = None
-            if self.backdoor_1st_net is not None:
-                backdoor_1st_feature = self.backdoor_1st_net(fold.backdoor)
-
-            stage1_feature = DFPVTrainerMAR._augment_stage1(
-                treatment_1st_feature,
-                treatment_proxy_feature,
-                backdoor_1st_feature,
-                self.add_stage1_intercept,
-            )
-            # V̂ from Stage-1 closed-form solution using phi_dr as target
-            stage1_weight = fit_linear(phi_dr, stage1_feature, self.lam1)
-            mu_hat = linear_reg_pred(stage1_feature, stage1_weight)  # (n, d_W)
 
         for _ in range(self.stage2_iter):
             self.treatment_2nd_opt.zero_grad()
@@ -403,7 +456,7 @@ class DFPVTrainerMAR:
                 backdoor_2nd_feature = self.backdoor_2nd_net(fold.backdoor)
 
             stage2_feature = DFPVTrainerMAR._augment_stage2(
-                mu_hat,
+                phi_dr,
                 treatment_2nd_feature,
                 backdoor_2nd_feature,
                 self.add_stage2_intercept,
@@ -497,14 +550,14 @@ class DFPVTrainerMAR:
 
     @staticmethod
     def _augment_stage2(
-        mu_hat: torch.Tensor,
+        outcome_proxy_feature: torch.Tensor,
         treatment_feature: torch.Tensor,
         backdoor_feature: Optional[torch.Tensor],
         add_intercept: bool,
     ) -> torch.Tensor:
         from src.models.DFPV.model import DFPVModel
         return DFPVModel.augment_stage2_feature(
-            mu_hat, treatment_feature, backdoor_feature, add_intercept
+            outcome_proxy_feature, treatment_feature, backdoor_feature, add_intercept
         )
 
 
