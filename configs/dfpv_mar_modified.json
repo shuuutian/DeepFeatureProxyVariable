@@ -4,11 +4,11 @@
         "name": "demand",
         "n_sample": 1000,
         "missing_rate": 0.3,
-        "mar_alpha_value": 1.6,
+        "mar_alpha_value": 1.0,
         "preprocess": "Identity"
     },
     "model": {
-        "name": "dfpv_mar_modified_new",
+        "name": "dfpv_mar_modified",
         "lam1": 0.1,
         "lam2": 0.1,
         "stage1_iter": 20,

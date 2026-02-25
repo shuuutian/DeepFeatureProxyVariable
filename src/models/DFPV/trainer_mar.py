@@ -12,7 +12,6 @@ from src.models.DFPV.model_mar import DFPVModelMAR
 from src.models.DFPV.nuisance_models import NuisanceModels
 from src.models.DFPV.dr_utils import (
     construct_L_plus,
-    construct_L,
     compute_dr_pseudo_outcome,
     compute_effective_sample_size,
 )
@@ -112,6 +111,10 @@ class DFPVTrainerMAR:
         # Nuisance models — initialized lazily in train() once data dims are known
         self.nuisance_models: Optional[NuisanceModels] = None
 
+        # Training history for nuisance models; populated by _fit_nuisance_models.
+        # Each entry: {"label": str, "propensity": [float], "imputation": [float]}
+        self.nuisance_history: list = []
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -144,9 +147,11 @@ class DFPVTrainerMAR:
             if verbose >= 1:
                 logger.info(f"Epoch {t} ended")
 
-        # Final fit on all data — no reset, warm-start from last epoch's weights
-        self._fit_nuisance_models(train_data_t, reset=False)
-        phi_dr_full = self._compute_dr_pseudo_outcome(train_data_t, verbose)
+        # Final cross-fitted phi_DR — satisfies B2: for each i in I_k, nuisance
+        # is fitted only on I_{-k}, so phi_DR_i is evaluated out-of-sample.
+        # This replaces the previous approach of fitting nuisance on ALL data then
+        # evaluating on the same ALL data, which violated the cross-fitting assumption.
+        phi_dr_full = self._compute_crossfitted_phi_dr(train_data_t, fold_indices, verbose)
 
         mdl = DFPVModelMAR(
             self.treatment_1st_net,
@@ -204,11 +209,6 @@ class DFPVTrainerMAR:
         if reset:
             self.nuisance_models.reset_weights()
 
-        L = construct_L(
-            train_fold.treatment,
-            train_fold.treatment_proxy,
-            train_fold.backdoor,
-        )
         L_plus = construct_L_plus(
             train_fold.treatment,
             train_fold.treatment_proxy,
@@ -220,17 +220,23 @@ class DFPVTrainerMAR:
         with torch.no_grad():
             psi_w = self.outcome_proxy_net(train_fold.outcome_proxy)
 
-        self.nuisance_models.fit_propensity(
+        prop_hist = self.nuisance_models.fit_propensity(
             L_plus=L_plus,
             delta_w=train_fold.delta_w,
             n_epochs=self.nuisance_n_epochs,
         )
-        self.nuisance_models.fit_imputation(
-            L=L,
+        imp_hist = self.nuisance_models.fit_imputation(
+            L_plus=L_plus,
             psi_w_targets=psi_w,
             delta_w=train_fold.delta_w,
             n_epochs=self.nuisance_n_epochs,
         )
+        label = "final" if not reset else f"fold"
+        self.nuisance_history.append({
+            "label": label,
+            "propensity": prop_hist,
+            "imputation": imp_hist,
+        })
 
     def _compute_dr_pseudo_outcome(
         self,
@@ -241,11 +247,10 @@ class DFPVTrainerMAR:
 
         phi_DR_i = m̂(L_i) + (δ_{W,i} / ê(L+_i)) * (ψ_{θ_W}(W_i) - m̂(L_i))
         """
-        L = construct_L(fold.treatment, fold.treatment_proxy, fold.backdoor)
         L_plus = construct_L_plus(fold.treatment, fold.treatment_proxy, fold.outcome, fold.backdoor)
 
         e_hat = self.nuisance_models.predict_propensity(L_plus)   # (n, 1)
-        m_hat = self.nuisance_models.predict_imputation(L)         # (n, d_W)
+        m_hat = self.nuisance_models.predict_imputation(L_plus)    # (n, d_W)
 
         with torch.no_grad():
             psi_w = self.outcome_proxy_net(fold.outcome_proxy)     # (n, d_W)
@@ -264,6 +269,35 @@ class DFPVTrainerMAR:
             propensity_clip=self.propensity_clip,
         )
         return phi_dr.detach()
+
+    def _compute_crossfitted_phi_dr(
+        self,
+        data: PVTrainDataSetMARTorch,
+        fold_indices: List[torch.Tensor],
+        verbose: int,
+    ) -> torch.Tensor:
+        """Compute cross-fitted φ_DR for every observation without data leakage.
+
+        For each fold k:
+          1. Re-fit nuisance from scratch on I_{-k}  (reset=True)
+          2. Evaluate φ_DR on I_k
+          3. Write results back into the full-data tensor by original index
+
+        The resulting phi_dr_full[i] was always computed with nuisance models
+        that never saw observation i during training, satisfying assumption B2.
+        """
+        n = data.treatment.shape[0]
+        with torch.no_grad():
+            psi_w_sample = self.outcome_proxy_net(data.outcome_proxy[:1])
+        d_w = psi_w_sample.shape[1]
+
+        phi_dr_full = torch.zeros(n, d_w)
+        for k in range(self.n_folds):
+            train_fold, val_fold = get_train_val_split(data, fold_indices, k)
+            self._fit_nuisance_models(train_fold, reset=True)
+            phi_dr_k = self._compute_dr_pseudo_outcome(val_fold, verbose)
+            phi_dr_full[fold_indices[k]] = phi_dr_k
+        return phi_dr_full
 
     # ------------------------------------------------------------------
     # Stage update methods
@@ -387,6 +421,65 @@ class DFPVTrainerMAR:
                 self.backdoor_2nd_opt.step()
 
     # ------------------------------------------------------------------
+    # Nuisance diagnostics
+    # ------------------------------------------------------------------
+
+    def plot_nuisance_history(self, save_path: Optional[str] = None):
+        """Plot per-epoch training loss of propensity and imputation models.
+
+        Fold runs are shown as faint lines; the final all-data fit is highlighted
+        in bold so over/under-fitting is easy to spot:
+          - Loss still decreasing at the last epoch  → underfitting (increase nuisance_n_epochs)
+          - Loss plateaued well before the last epoch → converged (epochs may be excessive)
+          - High variance across folds               → high nuisance estimation variance
+
+        Args:
+            save_path: if given, save figure to this path instead of showing it.
+        """
+        import matplotlib.pyplot as plt
+
+        fold_runs = [h for h in self.nuisance_history if h["label"] == "fold"]
+        final_runs = [h for h in self.nuisance_history if h["label"] == "final"]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        fig.suptitle("Nuisance model training history", fontsize=13)
+
+        for ax, key, ylabel in zip(
+            axes,
+            ("propensity", "imputation"),
+            ("BCE loss (propensity)", "MSE loss (imputation)"),
+        ):
+            for h in fold_runs:
+                losses = h[key]
+                if losses:
+                    ax.plot(losses, color="steelblue", alpha=0.25, linewidth=0.8)
+            for h in final_runs:
+                losses = h[key]
+                if losses:
+                    ax.plot(losses, color="black", linewidth=2.0, label="final fit")
+                    ax.axhline(losses[-1], color="black", linestyle=":", linewidth=0.8,
+                               label=f"final={losses[-1]:.4f}")
+
+            if fold_runs:
+                # Dummy line for legend
+                ax.plot([], [], color="steelblue", alpha=0.6, linewidth=1.0,
+                        label=f"fold runs (n={len(fold_runs)})")
+
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(ylabel)
+            ax.set_title(ylabel)
+            ax.legend(fontsize=8)
+            ax.grid(True, linewidth=0.4, alpha=0.5)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            logger.info(f"Nuisance history plot saved to {save_path}")
+        else:
+            plt.show()
+        plt.close(fig)
+
+    # ------------------------------------------------------------------
     # Static helpers (delegate to DFPVModel to avoid duplication)
     # ------------------------------------------------------------------
 
@@ -454,17 +547,9 @@ def dfpv_experiments_mar_modified(
     trainer = DFPVTrainerMAR(data_config, model_param, gpu_flg=False, random_seed=random_seed)
     mdl = trainer.train(train_data, verbose)
 
-    # For prediction we need training Z and X to marginalize over
-    train_data_t = PVTrainDataSetMARTorch.from_numpy(train_data)
-    test_treatment_t = torch.tensor(test_data.treatment, dtype=torch.float32)
-    train_proxy_t = train_data_t.treatment_proxy
-    train_backdoor_t = train_data_t.backdoor
 
-    pred: np.ndarray = mdl.predict_t(
-        treatment=test_treatment_t,
-        train_treatment_proxy=train_proxy_t,
-        train_backdoor=train_backdoor_t,
-    ).detach().cpu().numpy()
+    test_treatment_t = torch.tensor(test_data.treatment, dtype=torch.float32)
+    pred: np.ndarray = mdl.predict_t(test_treatment_t).detach().cpu().numpy()
     pred = preprocessor.postprocess_for_prediction(pred)
 
     oos_loss = 0.0

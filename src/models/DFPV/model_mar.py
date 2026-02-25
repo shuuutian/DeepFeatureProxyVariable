@@ -93,6 +93,7 @@ class DFPVModelMAR:
 
         return dict(
             stage1_weight=stage1_weight,
+            mu_hat=mu_hat,
             stage2_weight=stage2_weight,
             stage2_loss=stage2_loss,
         )
@@ -139,6 +140,17 @@ class DFPVModelMAR:
         self.stage1_weight = res["stage1_weight"]
         self.stage2_weight = res["stage2_weight"]
 
+        # Store the mean of φ_DR over training data as the fixed proxy-feature
+        # constant used at prediction time.  This is the MAR analogue of
+        # mean(ψ_W(W_i)) in Oracle DFPV:
+        #   Oracle:   (1/n) Σ ψ_{θ_W}(W_i)  ≈ E[ψ_W(W)]
+        #   MAR fix:  (1/n) Σ φ_DR,i         ≈ E[ψ_W(W)]   (φ_DR is its DR estimator)
+        # Using res["mu_hat"].mean() instead would give (1/n) Σ μ̂(A_i,Z_i,X_i), which
+        # is NOT the same: ridge regularisation breaks the OLS property
+        # mean(fitted) = mean(target), so mean(μ̂) < mean(φ_DR) systematically,
+        # causing the ~-4 to -5 level shift seen in experiments.
+        self.mean_phi_dr = phi_dr.mean(dim=0, keepdim=True)  # (1, d_W)
+
         self.mean_backdoor_feature = None
         if backdoor_2nd_feature is not None:
             self.mean_backdoor_feature = torch.mean(backdoor_2nd_feature, dim=0, keepdim=True)
@@ -146,73 +158,36 @@ class DFPVModelMAR:
     def predict_t(
         self,
         treatment: torch.Tensor,
-        train_treatment_proxy: torch.Tensor,
-        train_backdoor: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Predict counterfactual mean β̂(a) for each treatment value in batch.
 
-        Implements thesis Eq. beta_plugin:
-            β̂(a) = (1/n) Σ_i û^T( ψ_{A(2)}(a) ⊗ μ̂(a, Z_i, X_i) ⊗ φ_{X(2)}(X_i) )
+        Mirrors original DFPVModel.predict_t exactly: the "outcome proxy" slot is
+        filled with the fixed empirical mean of μ̂(A_i, Z_i, X_i) over training data
+        (stored as self.mean_phi_dr), NOT re-evaluated at the test treatment value a.
 
-        Note: A is set to the intervention value `a` both in Stage-1 (inside μ̂)
-        and in Stage-2 (ψ_{A(2)}(a)). This is the counterfactual evaluation.
+        Re-evaluating Stage-1 with a_test would inject a spurious extra dependence
+        on a through φ_A(a_test), creating a different function class from what
+        Stage-2 was trained to invert and producing a monotone extrapolation artefact.
 
         Args:
-            treatment:            (n_test, d_a)  — intervention values a to evaluate
-            train_treatment_proxy:(n_train, d_z)  — Z from TRAINING data (marginalise over)
-            train_backdoor:       (n_train, d_x) or None — X from TRAINING data
-
-        For each test treatment a_j, β̂(a_j) is the average over all training (Z_i, X_i).
+            treatment: (n_test, d_a) — intervention values a to evaluate
         """
         n_test = treatment.shape[0]
-        n_train = train_treatment_proxy.shape[0]
+        treatment_feature = self.treatment_2nd_net(treatment)       # ψ_A(a)
+        mean_phi_dr_mat = self.mean_phi_dr.expand(n_test, -1)       # fixed (n_test, d_W)
+        mean_backdoor_mat = None
+        if self.mean_backdoor_feature is not None:
+            mean_backdoor_mat = self.mean_backdoor_feature.expand(n_test, -1)
 
-        preds = []
-        for j in range(n_test):
-            a_j = treatment[j:j+1].expand(n_train, -1)  # (n_train, d_a)
+        feature = DFPVModel.augment_stage2_feature(
+            predicted_outcome_proxy_feature=mean_phi_dr_mat,
+            treatment_feature=treatment_feature,
+            backdoor_feature=mean_backdoor_mat,
+            add_stage2_intercept=self.add_stage2_intercept,
+        )
+        return linear_reg_pred(feature, self.stage2_weight)
 
-            # Stage-1 features with A=a_j (counterfactual)
-            a_j_1st = self.treatment_1st_net(a_j)
-            z_feat = self.treatment_proxy_net(train_treatment_proxy)
-            x_1st_feat = None
-            x_2nd_feat = None
-            if self.backdoor_1st_net is not None:
-                x_1st_feat = self.backdoor_1st_net(train_backdoor)
-                x_2nd_feat = self.backdoor_2nd_net(train_backdoor)
-
-            s1_feature = DFPVModel.augment_stage1_feature(
-                treatment_feature=a_j_1st,
-                treatment_proxy_feature=z_feat,
-                backdoor_feature=x_1st_feat,
-                add_stage1_intercept=self.add_stage1_intercept,
-            )
-            mu_hat = linear_reg_pred(s1_feature, self.stage1_weight)  # (n_train, d_W)
-
-            # Stage-2 features with A=a_j
-            a_j_2nd = self.treatment_2nd_net(a_j)
-            s2_feature = DFPVModel.augment_stage2_feature(
-                predicted_outcome_proxy_feature=mu_hat,
-                treatment_feature=a_j_2nd,
-                backdoor_feature=x_2nd_feat,
-                add_stage2_intercept=self.add_stage2_intercept,
-            )
-            # Average over training samples → scalar β̂(a_j)
-            mean_feature = s2_feature.mean(dim=0, keepdim=True)  # (1, feature_dim)
-            pred_j = linear_reg_pred(mean_feature, self.stage2_weight)  # (1, 1) or (1,)
-            preds.append(pred_j)
-
-        return torch.cat(preds, dim=0)  # (n_test, 1) or (n_test,)
-
-    def predict(
-        self,
-        treatment: np.ndarray,
-        train_treatment_proxy: np.ndarray,
-        train_backdoor: Optional[np.ndarray],
-    ) -> np.ndarray:
+    def predict(self, treatment: np.ndarray) -> np.ndarray:
         treatment_t = torch.tensor(treatment, dtype=torch.float32)
-        proxy_t = torch.tensor(train_treatment_proxy, dtype=torch.float32)
-        backdoor_t = None
-        if train_backdoor is not None:
-            backdoor_t = torch.tensor(train_backdoor, dtype=torch.float32)
         with torch.no_grad():
-            return self.predict_t(treatment_t, proxy_t, backdoor_t).detach().numpy()
+            return self.predict_t(treatment_t).detach().numpy()
