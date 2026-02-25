@@ -1,9 +1,10 @@
 {
-    "n_repeat": 500,
+    "n_repeat": 100,
     "data": {
         "name": "demand",
         "n_sample": 1000,
         "missing_rate": 0.3,
+        "mar_alpha_value": 1.6,
         "preprocess": "Identity"
     },
     "model": {

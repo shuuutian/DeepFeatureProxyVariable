@@ -68,7 +68,7 @@ def experiments(configs: Dict[str, Any],
         logger.critical(f"{dump_name} ended")
 
 if __name__ == "__main__":
-    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified.json")
+    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified_new.json")
     with config_path.open("r") as f:
         config = json.load(f)
 

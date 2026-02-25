@@ -140,11 +140,16 @@ class DFPVModelMAR:
         self.stage1_weight = res["stage1_weight"]
         self.stage2_weight = res["stage2_weight"]
 
-        # Store the mean of μ̂(A_i, Z_i, X_i) over training data — this is the
-        # MAR analogue of mean_outcome_proxy_feature in DFPVModel.  It is a
-        # fixed constant at prediction time; re-evaluating Stage-1 with the
-        # test treatment value a would wrongly inject extra dependence on a.
-        self.mean_phi_dr = res["mu_hat"].mean(dim=0, keepdim=True)  # (1, d_W)
+        # Store the mean of φ_DR over training data as the fixed proxy-feature
+        # constant used at prediction time.  This is the MAR analogue of
+        # mean(ψ_W(W_i)) in Oracle DFPV:
+        #   Oracle:   (1/n) Σ ψ_{θ_W}(W_i)  ≈ E[ψ_W(W)]
+        #   MAR fix:  (1/n) Σ φ_DR,i         ≈ E[ψ_W(W)]   (φ_DR is its DR estimator)
+        # Using res["mu_hat"].mean() instead would give (1/n) Σ μ̂(A_i,Z_i,X_i), which
+        # is NOT the same: ridge regularisation breaks the OLS property
+        # mean(fitted) = mean(target), so mean(μ̂) < mean(φ_DR) systematically,
+        # causing the ~-4 to -5 level shift seen in experiments.
+        self.mean_phi_dr = phi_dr.mean(dim=0, keepdim=True)  # (1, d_W)
 
         self.mean_backdoor_feature = None
         if backdoor_2nd_feature is not None:

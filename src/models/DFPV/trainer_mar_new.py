@@ -12,7 +12,6 @@ from src.models.DFPV.model_mar_new import DFPVModelMAR
 from src.models.DFPV.nuisance_models import NuisanceModels
 from src.models.DFPV.dr_utils import (
     construct_L_plus,
-    construct_L,
     compute_dr_pseudo_outcome,
     compute_effective_sample_size,
 )
@@ -148,9 +147,11 @@ class DFPVTrainerMAR:
             if verbose >= 1:
                 logger.info(f"Epoch {t} ended")
 
-        # Final fit on all data — no reset, warm-start from last epoch's weights
-        self._fit_nuisance_models(train_data_t, reset=False)
-        phi_dr_full = self._compute_dr_pseudo_outcome(train_data_t, verbose)
+        # Final cross-fitted phi_DR — satisfies B2: for each i in I_k, nuisance
+        # is fitted only on I_{-k}, so phi_DR_i is evaluated out-of-sample.
+        # This replaces the previous approach of fitting nuisance on ALL data then
+        # evaluating on the same ALL data, which violated the cross-fitting assumption.
+        phi_dr_full = self._compute_crossfitted_phi_dr(train_data_t, fold_indices, verbose)
 
         mdl = DFPVModelMAR(
             self.treatment_1st_net,
@@ -208,11 +209,6 @@ class DFPVTrainerMAR:
         if reset:
             self.nuisance_models.reset_weights()
 
-        L = construct_L(
-            train_fold.treatment,
-            train_fold.treatment_proxy,
-            train_fold.backdoor,
-        )
         L_plus = construct_L_plus(
             train_fold.treatment,
             train_fold.treatment_proxy,
@@ -230,7 +226,7 @@ class DFPVTrainerMAR:
             n_epochs=self.nuisance_n_epochs,
         )
         imp_hist = self.nuisance_models.fit_imputation(
-            L=L,
+            L_plus=L_plus,
             psi_w_targets=psi_w,
             delta_w=train_fold.delta_w,
             n_epochs=self.nuisance_n_epochs,
@@ -251,11 +247,10 @@ class DFPVTrainerMAR:
 
         phi_DR_i = m̂(L_i) + (δ_{W,i} / ê(L+_i)) * (ψ_{θ_W}(W_i) - m̂(L_i))
         """
-        L = construct_L(fold.treatment, fold.treatment_proxy, fold.backdoor)
         L_plus = construct_L_plus(fold.treatment, fold.treatment_proxy, fold.outcome, fold.backdoor)
 
         e_hat = self.nuisance_models.predict_propensity(L_plus)   # (n, 1)
-        m_hat = self.nuisance_models.predict_imputation(L)         # (n, d_W)
+        m_hat = self.nuisance_models.predict_imputation(L_plus)    # (n, d_W)
 
         with torch.no_grad():
             psi_w = self.outcome_proxy_net(fold.outcome_proxy)     # (n, d_W)
@@ -274,6 +269,35 @@ class DFPVTrainerMAR:
             propensity_clip=self.propensity_clip,
         )
         return phi_dr.detach()
+
+    def _compute_crossfitted_phi_dr(
+        self,
+        data: PVTrainDataSetMARTorch,
+        fold_indices: List[torch.Tensor],
+        verbose: int,
+    ) -> torch.Tensor:
+        """Compute cross-fitted φ_DR for every observation without data leakage.
+
+        For each fold k:
+          1. Re-fit nuisance from scratch on I_{-k}  (reset=True)
+          2. Evaluate φ_DR on I_k
+          3. Write results back into the full-data tensor by original index
+
+        The resulting phi_dr_full[i] was always computed with nuisance models
+        that never saw observation i during training, satisfying assumption B2.
+        """
+        n = data.treatment.shape[0]
+        with torch.no_grad():
+            psi_w_sample = self.outcome_proxy_net(data.outcome_proxy[:1])
+        d_w = psi_w_sample.shape[1]
+
+        phi_dr_full = torch.zeros(n, d_w)
+        for k in range(self.n_folds):
+            train_fold, val_fold = get_train_val_split(data, fold_indices, k)
+            self._fit_nuisance_models(train_fold, reset=True)
+            phi_dr_k = self._compute_dr_pseudo_outcome(val_fold, verbose)
+            phi_dr_full[fold_indices[k]] = phi_dr_k
+        return phi_dr_full
 
     # ------------------------------------------------------------------
     # Stage update methods

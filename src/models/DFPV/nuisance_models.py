@@ -36,7 +36,10 @@ class NuisanceModels:
         self._dropout = dropout
 
         self.propensity_net = self._build_classifier(dim_L_plus, hidden_dim, n_layers, dropout)
-        self.imputation_net = self._build_regressor(dim_L, dim_psi_w, hidden_dim, n_layers, dropout)
+        # Imputation takes L+ = (A,Z,X,Y) — needed for the DR second protection to hold.
+        # Using L=(A,Z,X) instead would make the second DR insurance (imputation correct ⟹
+        # consistent) fail whenever the propensity is misspecified.
+        self.imputation_net = self._build_regressor(dim_L_plus, dim_psi_w, hidden_dim, n_layers, dropout)
 
         if gpu_flg:
             self.propensity_net.to("cuda:0")
@@ -98,7 +101,7 @@ class NuisanceModels:
 
     def fit_imputation(
         self,
-        L: torch.Tensor,
+        L_plus: torch.Tensor,
         psi_w_targets: torch.Tensor,
         delta_w: torch.Tensor,
         n_epochs: int = 50,
@@ -106,9 +109,10 @@ class NuisanceModels:
         """Train imputation model on complete cases only.
 
         Args:
-            L:             (n, dim_L)   — concatenation of (A, Z, X)
-            psi_w_targets: (n, dim_psi_w) — ψ_{θ_W}(W_i); ignored where delta_w=0
-            delta_w:       (n,) or (n,1)  — missingness indicator
+            L_plus:        (n, dim_L_plus) — concatenation of (A, Z, Y, X); Y is always
+                           observed so L+ is available for all n rows even when W is missing.
+            psi_w_targets: (n, dim_psi_w)  — ψ_{θ_W}(W_i); ignored where delta_w=0
+            delta_w:       (n,) or (n,1)   — missingness indicator
             n_epochs: training epochs
 
         Returns:
@@ -119,10 +123,10 @@ class NuisanceModels:
         else:
             delta_w_mask = delta_w.bool()
 
-        L_obs = L[delta_w_mask]
+        L_plus_obs = L_plus[delta_w_mask]
         targets_obs = psi_w_targets[delta_w_mask]
 
-        if L_obs.shape[0] == 0:
+        if L_plus_obs.shape[0] == 0:
             return []  # no complete cases in this fold, skip
 
         mse = nn.MSELoss()
@@ -130,7 +134,7 @@ class NuisanceModels:
         history = []
         for _ in range(n_epochs):
             self.imputation_opt.zero_grad()
-            m_hat = self.imputation_net(L_obs)
+            m_hat = self.imputation_net(L_plus_obs)
             loss = mse(m_hat, targets_obs)
             loss.backward()
             self.imputation_opt.step()
@@ -144,11 +148,11 @@ class NuisanceModels:
         with torch.no_grad():
             return self.propensity_net(L_plus)
 
-    def predict_imputation(self, L: torch.Tensor) -> torch.Tensor:
-        """Return m̂_ψ(L) in R^{d_W}. Shape: (n, dim_psi_w)."""
+    def predict_imputation(self, L_plus: torch.Tensor) -> torch.Tensor:
+        """Return m̂_ψ(L+) in R^{d_W}. Shape: (n, dim_psi_w)."""
         self.imputation_net.train(False)
         with torch.no_grad():
-            return self.imputation_net(L)
+            return self.imputation_net(L_plus)
 
     def reset_weights(self):
         """Re-initialise nuisance networks and optimisers from scratch.
@@ -164,7 +168,7 @@ class NuisanceModels:
             self._dim_L_plus, self._hidden_dim, self._n_layers, self._dropout
         ).to(device)
         self.imputation_net = self._build_regressor(
-            self._dim_L, self._dim_psi_w, self._hidden_dim, self._n_layers, self._dropout
+            self._dim_L_plus, self._dim_psi_w, self._hidden_dim, self._n_layers, self._dropout
         ).to(device)
 
         self.propensity_opt = torch.optim.Adam(self.propensity_net.parameters(), lr=1e-3)
