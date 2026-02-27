@@ -13,8 +13,8 @@ class DFPVModelMAR:
 
     Key differences from DFPVModel:
     - Stage 1 target is φ_DR (doubly robust pseudo-outcome), not ψ_W(W)
-    - θ_W (outcome_proxy_net) is pre-trained once then frozen during MAR fitting
-    - Stage 2 uses μ̂(L) = V̂·(φ_A(A)⊗φ_Z(Z)⊗φ_X(X)) instead of ψ_W(W)
+    - θ_W (outcome_proxy_net) is optimized from Stage 2 (Stage 1 treats ψ_W target as detached)
+    - Stage 2 uses μ̂(L) = V̂·(φ_A(A)⊗φ_Z(Z)⊗φ_X(X))
     - ATE prediction uses μ̂(a, Z_i, X_i) with A set to intervention value a
 
     Reference: Thesis Section 5.1.3, Algorithm 5.1
@@ -22,8 +22,8 @@ class DFPVModelMAR:
 
     stage1_weight: torch.Tensor   # V̂
     stage2_weight: torch.Tensor   # û
-    mean_phi_dr: torch.Tensor
-    mean_joint_phi_dr_x: Optional[torch.Tensor]  # M̂ = (1/n) Σ φ_DR,i ⊗ φ_X(X_i)
+    mean_mu_hat: torch.Tensor
+    mean_joint_mu_hat_x: Optional[torch.Tensor]  # M̂ = (1/n) Σ μ̂_i ⊗ φ_X(X_i)
 
     def __init__(
         self,
@@ -39,7 +39,7 @@ class DFPVModelMAR:
         self.treatment_1st_net = treatment_1st_net
         self.treatment_2nd_net = treatment_2nd_net
         self.treatment_proxy_net = treatment_proxy_net
-        self.outcome_proxy_net = outcome_proxy_net   # frozen — never updated
+        self.outcome_proxy_net = outcome_proxy_net
         self.backdoor_1st_net = backdoor_1st_net
         self.backdoor_2nd_net = backdoor_2nd_net
         self.add_stage1_intercept = add_stage1_intercept
@@ -64,10 +64,7 @@ class DFPVModelMAR:
         """Two-stage least squares for modified DFPV.
 
         Stage 1: Regress φ_DR on (A,Z,X) features → solve for V̂
-        Stage 2: Regress Y on (A, φ_DR, X) features → solve for û
-
-        phi_dr serves as both Stage-1 target and Stage-2 proxy feature.
-        This keeps Stage-2 training consistent with prediction-time aggregation.
+        Stage 2: Regress Y on (A, μ̂(L), X) where μ̂(L)=V̂·Φ(A,Z,X) → solve for û
         """
         # Stage 1: fit V̂ by regressing phi_DR on (A,Z,X) features
         stage1_feature = DFPVModel.augment_stage1_feature(
@@ -77,10 +74,11 @@ class DFPVModelMAR:
             add_stage1_intercept=add_stage1_intercept,
         )
         stage1_weight = fit_linear(phi_dr, stage1_feature, lam1)
+        mu_hat = linear_reg_pred(stage1_feature, stage1_weight)
 
-        # Stage 2: regress Y on (ψ_{A(2)}(A) ⊗ φ_DR ⊗ φ_{X(2)}(X))
+        # Stage 2: regress Y on (ψ_{A(2)}(A) ⊗ μ̂(L) ⊗ φ_{X(2)}(X))
         stage2_feature = DFPVModel.augment_stage2_feature(
-            predicted_outcome_proxy_feature=phi_dr,
+            predicted_outcome_proxy_feature=mu_hat,
             treatment_feature=treatment_2nd_feature,
             backdoor_feature=backdoor_2nd_feature,
             add_stage2_intercept=add_stage2_intercept,
@@ -91,6 +89,7 @@ class DFPVModelMAR:
 
         return dict(
             stage1_weight=stage1_weight,
+            mu_hat=mu_hat,
             stage2_weight=stage2_weight,
             stage2_loss=stage2_loss,
         )
@@ -136,24 +135,21 @@ class DFPVModelMAR:
 
         self.stage1_weight = res["stage1_weight"]
         self.stage2_weight = res["stage2_weight"]
+        mu_hat = res["mu_hat"]
 
-        # Store mean(φ_DR) for the no-backdoor fallback path.
-        # Using res["mu_hat"].mean() would underestimate E[ψ_W(W)] due to ridge
-        # shrinkage breaking mean(fitted) = mean(target).
-        self.mean_phi_dr = phi_dr.mean(dim=0, keepdim=True)  # (1, d_W)
+        # Store mean(μ̂) for the no-backdoor fallback path.
+        self.mean_mu_hat = mu_hat.mean(dim=0, keepdim=True)  # (1, d_W)
 
-        # Critical fix: store the joint mean M̂ = (1/n) Σ_i φ_DR,i ⊗ φ_X(X_i)
-        # instead of the product of separate means mean(φ_DR) ⊗ mean(φ_X).
-        # φ_DR,i depends on X_i (via L_i), so their cross-covariance is non-zero,
-        # and mean(φ_DR ⊗ φ_X) ≠ mean(φ_DR) ⊗ mean(φ_X) in general.
+        # Store the joint mean M̂ = (1/n) Σ_i μ̂_i ⊗ φ_X(X_i) instead of the
+        # product of separate means; μ̂_i and φ_X(X_i) are generally correlated.
         # Intercepts are incorporated into each component before the Kronecker product
         # to match exactly how Stage-2 training features were constructed.
-        self.mean_joint_phi_dr_x = None
+        self.mean_joint_mu_hat_x = None
         if backdoor_2nd_feature is not None:
-            phi_dr_aug = add_const_col(phi_dr) if self.add_stage2_intercept else phi_dr
+            mu_hat_aug = add_const_col(mu_hat) if self.add_stage2_intercept else mu_hat
             bdoor_aug = add_const_col(backdoor_2nd_feature) if self.add_stage2_intercept else backdoor_2nd_feature
-            joint = torch.flatten(outer_prod(phi_dr_aug, bdoor_aug), start_dim=1)
-            self.mean_joint_phi_dr_x = joint.mean(dim=0, keepdim=True)  # (1, d_W[+1]*d_X[+1])
+            joint = torch.flatten(outer_prod(mu_hat_aug, bdoor_aug), start_dim=1)
+            self.mean_joint_mu_hat_x = joint.mean(dim=0, keepdim=True)  # (1, d_W[+1]*d_X[+1])
 
     def predict_t(
         self,
@@ -163,7 +159,7 @@ class DFPVModelMAR:
 
         Mirrors original DFPVModel.predict_t exactly: the "outcome proxy" slot is
         filled with the fixed empirical mean of μ̂(A_i, Z_i, X_i) over training data
-        (stored as self.mean_phi_dr), NOT re-evaluated at the test treatment value a.
+        (stored as self.mean_mu_hat), NOT re-evaluated at the test treatment value a.
 
         Re-evaluating Stage-1 with a_test would inject a spurious extra dependence
         on a through φ_A(a_test), creating a different function class from what
@@ -175,17 +171,17 @@ class DFPVModelMAR:
         n_test = treatment.shape[0]
         treatment_feature = self.treatment_2nd_net(treatment)  # ψ_A(a)
 
-        if self.mean_joint_phi_dr_x is not None:
+        if self.mean_joint_mu_hat_x is not None:
             # Prediction: ψ_A_aug(a) ⊗ M̂
-            # M̂ = (1/n) Σ_i φ_DR_aug,i ⊗ φ_X_aug(X_i) already incorporates intercepts.
+            # M̂ = (1/n) Σ_i μ̂_aug,i ⊗ φ_X_aug(X_i) already incorporates intercepts.
             if self.add_stage2_intercept:
                 treatment_feature = add_const_col(treatment_feature)
-            mean_joint_mat = self.mean_joint_phi_dr_x.expand(n_test, -1)
+            mean_joint_mat = self.mean_joint_mu_hat_x.expand(n_test, -1)
             feature = torch.flatten(outer_prod(treatment_feature, mean_joint_mat), start_dim=1)
         else:
-            mean_phi_dr_mat = self.mean_phi_dr.expand(n_test, -1)
+            mean_mu_hat_mat = self.mean_mu_hat.expand(n_test, -1)
             feature = DFPVModel.augment_stage2_feature(
-                predicted_outcome_proxy_feature=mean_phi_dr_mat,
+                predicted_outcome_proxy_feature=mean_mu_hat_mat,
                 treatment_feature=treatment_feature,
                 backdoor_feature=None,
                 add_stage2_intercept=self.add_stage2_intercept,

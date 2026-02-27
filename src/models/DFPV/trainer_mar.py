@@ -43,7 +43,7 @@ class DFPVTrainerMAR:
         Final fit on all data with final nuisance models.
 
     Key properties:
-    - outcome_proxy_net (θ_W) is pre-trained on complete cases, then frozen
+    - outcome_proxy_net (θ_W) is pre-trained and updated only in Stage 2
     - Nuisance imputation trained on L=(A,Z,X); propensity on L+=(A,Z,X,Y)
     """
 
@@ -68,18 +68,19 @@ class DFPVTrainerMAR:
         self.propensity_clip: float = train_params.get("propensity_clip", 1e-3)
         self.outcome_proxy_pretrain_epochs: int = train_params.get("outcome_proxy_pretrain_epochs", 50)
         self.outcome_proxy_pretrain_lr: float = train_params.get("outcome_proxy_pretrain_lr", 1e-3)
+        self.outcome_proxy_weight_decay = train_params["outcome_proxy_weight_decay"]
         self.add_stage1_intercept = True
         self.add_stage2_intercept = True
         self.treatment_weight_decay = train_params["treatment_weight_decay"]
         self.treatment_proxy_weight_decay = train_params["treatment_proxy_weight_decay"]
         self.backdoor_weight_decay = train_params["backdoor_weight_decay"]
 
-        # Build networks — outcome_proxy_net will be pre-trained once, then frozen.
+        # Build networks — outcome_proxy_net is pre-trained, then optimized in MAR loop.
         networks = build_extractor(data_configs["name"])
         self.treatment_1st_net: nn.Module = networks[0]
         self.treatment_2nd_net: nn.Module = networks[1]
         self.treatment_proxy_net: nn.Module = networks[2]
-        self.outcome_proxy_net: nn.Module = networks[3]  # θ_W — never updated
+        self.outcome_proxy_net: nn.Module = networks[3]  # θ_W
         self.backdoor_1st_net: Optional[nn.Module] = networks[4]
         self.backdoor_2nd_net: Optional[nn.Module] = networks[5]
 
@@ -92,7 +93,6 @@ class DFPVTrainerMAR:
                 self.backdoor_1st_net.to("cuda:0")
                 self.backdoor_2nd_net.to("cuda:0")
 
-        # θ_W has no persistent optimizer — it is not updated during MAR loop.
         self.treatment_1st_opt = torch.optim.Adam(
             self.treatment_1st_net.parameters(), weight_decay=self.treatment_weight_decay
         )
@@ -101,6 +101,9 @@ class DFPVTrainerMAR:
         )
         self.treatment_proxy_opt = torch.optim.Adam(
             self.treatment_proxy_net.parameters(), weight_decay=self.treatment_proxy_weight_decay
+        )
+        self.outcome_proxy_opt = torch.optim.Adam(
+            self.outcome_proxy_net.parameters(), weight_decay=self.outcome_proxy_weight_decay
         )
         if self.backdoor_1st_net is not None:
             self.backdoor_1st_opt = torch.optim.Adam(
@@ -127,7 +130,7 @@ class DFPVTrainerMAR:
         if self.gpu_flg:
             train_data_t = train_data_t.to_gpu()
 
-        self._pretrain_and_freeze_outcome_proxy(train_data_t, verbose)
+        self._pretrain_outcome_proxy(train_data_t, verbose)
 
         # Initialise nuisance models now that we know input dimensions
         self.nuisance_models = self._init_nuisance_models(train_data_t)
@@ -141,12 +144,12 @@ class DFPVTrainerMAR:
                 # Step 1: Fit nuisance on training folds I_{-k}
                 self._fit_nuisance_models(train_fold)
 
-                # Step 2: Compute φ_DR on validation fold I_k
-                phi_dr = self._compute_dr_pseudo_outcome(val_fold, verbose)
+                # Step 2: Compute nuisance predictions on I_k for DR pseudo-outcome
+                m_hat, e_hat = self._compute_dr_nuisance_predictions(val_fold, verbose)
 
                 # Step 3 & 4: Update Stage-1 and Stage-2 on validation fold I_k
-                self.stage1_update_mar(val_fold, phi_dr, verbose)
-                self.stage2_update_mar(val_fold, phi_dr, verbose)
+                self.stage1_update_mar(val_fold, m_hat, e_hat, verbose)
+                self.stage2_update_mar(val_fold, m_hat, e_hat, verbose)
 
             if verbose >= 1:
                 logger.info(f"Epoch {t} ended")
@@ -170,21 +173,18 @@ class DFPVTrainerMAR:
         mdl.fit_t(train_data_t, phi_dr_full, self.lam1, self.lam2)
         return mdl
 
-    def _pretrain_and_freeze_outcome_proxy(
+    def _pretrain_outcome_proxy(
         self,
         data: PVTrainDataSetMARTorch,
         verbose: int = 0,
     ):
-        """Pre-train θ_W on complete cases, then freeze it for MAR training.
+        """Pre-train θ_W on complete cases before MAR stage updates.
 
         Auxiliary objective: predict Y from [ψ_W(W), A, X] on rows with delta_w=1.
-        This removes the high-variance random-feature target for imputation while
-        preserving the MAR algorithm's frozen-θ_W requirement during cross-fitting.
+        This improves the starting representation used by nuisance imputation and DR
+        targets before joint end-to-end optimization.
         """
         if self.outcome_proxy_pretrain_epochs <= 0:
-            for p in self.outcome_proxy_net.parameters():
-                p.requires_grad_(False)
-            self.outcome_proxy_net.train(False)
             return
 
         if data.delta_w.dim() > 1:
@@ -193,9 +193,6 @@ class DFPVTrainerMAR:
             obs_mask = data.delta_w.bool()
         n_obs = int(obs_mask.sum().item())
         if n_obs == 0:
-            for p in self.outcome_proxy_net.parameters():
-                p.requires_grad_(False)
-            self.outcome_proxy_net.train(False)
             return
 
         device = next(self.outcome_proxy_net.parameters()).device
@@ -234,10 +231,6 @@ class DFPVTrainerMAR:
                 float(loss.detach().item()),
             )
 
-        for p in self.outcome_proxy_net.parameters():
-            p.requires_grad_(False)
-        self.outcome_proxy_net.train(False)
-
     # ------------------------------------------------------------------
     # Nuisance fitting and DR pseudo-outcome
     # ------------------------------------------------------------------
@@ -269,7 +262,7 @@ class DFPVTrainerMAR:
 
         Propensity: trained on ALL samples in fold using L+=(A,Z,X,Y)
         Imputation: trained on complete cases (delta_w=1) using L=(A,Z,X)
-                    with targets psi_{θ_W}(W_i) from frozen outcome_proxy_net
+                    with targets psi_{θ_W}(W_i) from current outcome_proxy_net
 
         Args:
             train_fold: data to fit on (I_{-k} during epoch loop, full data for final fit)
@@ -288,7 +281,7 @@ class DFPVTrainerMAR:
             train_fold.backdoor,
         )
 
-        # Extract ψ_{θ_W}(W_i) using frozen θ_W for complete cases
+        # Extract ψ_{θ_W}(W_i) with current θ_W for complete cases.
         with torch.no_grad():
             psi_w = self.outcome_proxy_net(train_fold.outcome_proxy)
 
@@ -310,28 +303,35 @@ class DFPVTrainerMAR:
             "imputation": imp_hist,
         })
 
-    def _compute_dr_pseudo_outcome(
+    def _compute_dr_nuisance_predictions(
         self,
         fold: PVTrainDataSetMARTorch,
         verbose: int = 0,
-    ) -> torch.Tensor:
-        """Compute φ_DR for all samples in fold using trained nuisance models.
-
-        phi_DR_i = m̂(L_i) + (δ_{W,i} / ê(L+_i)) * (ψ_{θ_W}(W_i) - m̂(L_i))
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute nuisance predictions (m_hat, e_hat) on a fold."""
         L_plus = construct_L_plus(fold.treatment, fold.treatment_proxy, fold.outcome, fold.backdoor)
 
-        e_hat = self.nuisance_models.predict_propensity(L_plus)   # (n, 1)
-        m_hat = self.nuisance_models.predict_imputation(L_plus)    # (n, d_W)
-
         with torch.no_grad():
-            psi_w = self.outcome_proxy_net(fold.outcome_proxy)     # (n, d_W)
+            e_hat = self.nuisance_models.predict_propensity(L_plus)   # (n, 1)
+            m_hat = self.nuisance_models.predict_imputation(L_plus)    # (n, d_W)
 
         if verbose >= 2:
             ess = compute_effective_sample_size(
                 e_hat.squeeze(1), fold.delta_w, self.propensity_clip
             )
             logger.info(f"DR ESS: {ess:.1f}")
+
+        return m_hat.detach(), e_hat.detach()
+
+    def _compute_dr_pseudo_outcome(
+        self,
+        fold: PVTrainDataSetMARTorch,
+        verbose: int = 0,
+    ) -> torch.Tensor:
+        """Compute detached φ_DR for all samples in fold using trained nuisance models."""
+        m_hat, e_hat = self._compute_dr_nuisance_predictions(fold, verbose)
+        with torch.no_grad():
+            psi_w = self.outcome_proxy_net(fold.outcome_proxy)     # (n, d_W)
 
         phi_dr = compute_dr_pseudo_outcome(
             psi_w=psi_w,
@@ -378,19 +378,21 @@ class DFPVTrainerMAR:
     def stage1_update_mar(
         self,
         fold: PVTrainDataSetMARTorch,
-        phi_dr: torch.Tensor,
+        m_hat: torch.Tensor,
+        e_hat: torch.Tensor,
         verbose: int,
     ):
         """Stage-1 gradient update using φ_DR as the regression target.
 
         Updates: treatment_1st_net, treatment_proxy_net, backdoor_1st_net
-        Frozen:  treatment_2nd_net, outcome_proxy_net, backdoor_2nd_net
-        Target:  φ_DR  (all samples — not just complete cases)
+        Frozen:  treatment_2nd_net, backdoor_2nd_net, outcome_proxy_net
+        Target:  φ_DR(θ_W) = m_hat + (δ/e_hat)(ψ_W(θ_W) - m_hat)
+        θ_W is detached (matches original DFPV Stage-1 treatment of ψ_W target).
         """
         self.treatment_1st_net.train(True)
         self.treatment_2nd_net.train(False)
         self.treatment_proxy_net.train(True)
-        self.outcome_proxy_net.train(False)   # always frozen
+        self.outcome_proxy_net.train(False)
         if self.backdoor_1st_net is not None:
             self.backdoor_1st_net.train(True)
             self.backdoor_2nd_net.train(False)
@@ -413,6 +415,15 @@ class DFPVTrainerMAR:
                 backdoor_1st_feature,
                 self.add_stage1_intercept,
             )
+            with torch.no_grad():
+                psi_w = self.outcome_proxy_net(fold.outcome_proxy)
+            phi_dr = compute_dr_pseudo_outcome(
+                psi_w=psi_w,
+                m_hat=m_hat,
+                e_hat=e_hat,
+                delta_w=fold.delta_w,
+                propensity_clip=self.propensity_clip,
+            )
             loss = linear_reg_loss(phi_dr, feature, self.lam1)
             loss.backward()
 
@@ -427,28 +438,57 @@ class DFPVTrainerMAR:
     def stage2_update_mar(
         self,
         fold: PVTrainDataSetMARTorch,
-        phi_dr: torch.Tensor,
+        m_hat: torch.Tensor,
+        e_hat: torch.Tensor,
         verbose: int,
     ):
-        """Stage-2 gradient update using φ_DR directly as proxy.
+        """Stage-2 gradient update — identical to Original DFPV stage2_update,
+        except outcome_proxy_feature is replaced by psi_tilde.
 
-        Updates: treatment_2nd_net, backdoor_2nd_net
-        Frozen:  treatment_1st_net, treatment_proxy_net, outcome_proxy_net,
-                 backdoor_1st_net
-        Note:    outcome_proxy_net (θ_W) is pre-trained once, then kept frozen.
+        Updates: treatment_2nd_net, backdoor_2nd_net, outcome_proxy_net (θ_W)
+        Frozen:  treatment_1st_net, treatment_proxy_net, backdoor_1st_net
+
+        θ_W gradient path (single consistent path, no IPW):
+          psi_tilde = δ·ψ_W(θ_W) + (1-δ)·m_hat.detach()
+          psi_tilde → V_hat → μ_hat → stage2_feature → stage2_weight → loss
         """
         self.treatment_1st_net.train(False)
         self.treatment_2nd_net.train(True)
         self.treatment_proxy_net.train(False)
-        self.outcome_proxy_net.train(False)   # always frozen
+        self.outcome_proxy_net.train(True)
         if self.backdoor_1st_net is not None:
             self.backdoor_1st_net.train(False)
             self.backdoor_2nd_net.train(True)
 
+        with torch.no_grad():
+            treatment_1st_feature = self.treatment_1st_net(fold.treatment)
+            treatment_proxy_feature = self.treatment_proxy_net(fold.treatment_proxy)
+            backdoor_1st_feature = None
+            if self.backdoor_1st_net is not None:
+                backdoor_1st_feature = self.backdoor_1st_net(fold.backdoor)
+            stage1_feature = DFPVTrainerMAR._augment_stage1(
+                treatment_1st_feature,
+                treatment_proxy_feature,
+                backdoor_1st_feature,
+                self.add_stage1_intercept,
+            )
+        delta_w = fold.delta_w
+        if delta_w.dim() == 1:
+            delta_w = delta_w.unsqueeze(1)
+        delta_w = delta_w.to(dtype=m_hat.dtype)
+
         for _ in range(self.stage2_iter):
             self.treatment_2nd_opt.zero_grad()
+            self.outcome_proxy_opt.zero_grad()
             if self.backdoor_2nd_net is not None:
                 self.backdoor_2nd_opt.zero_grad()
+
+            # Single path — identical to Original DFPV stage2_update.
+            # Only difference: psi_tilde replaces outcome_proxy_feature_1st.
+            psi_w = self.outcome_proxy_net(fold.outcome_proxy)
+            psi_tilde = delta_w * psi_w + (1.0 - delta_w) * m_hat.detach()
+            stage1_weight = fit_linear(psi_tilde, stage1_feature, self.lam1)
+            mu_hat = linear_reg_pred(stage1_feature, stage1_weight)
 
             treatment_2nd_feature = self.treatment_2nd_net(fold.treatment)
             backdoor_2nd_feature = None
@@ -456,7 +496,7 @@ class DFPVTrainerMAR:
                 backdoor_2nd_feature = self.backdoor_2nd_net(fold.backdoor)
 
             stage2_feature = DFPVTrainerMAR._augment_stage2(
-                phi_dr,
+                mu_hat,
                 treatment_2nd_feature,
                 backdoor_2nd_feature,
                 self.add_stage2_intercept,
@@ -470,6 +510,7 @@ class DFPVTrainerMAR:
                 logger.info(f"stage2_mar learning: {loss.item()}")
 
             self.treatment_2nd_opt.step()
+            self.outcome_proxy_opt.step()
             if self.backdoor_2nd_net is not None:
                 self.backdoor_2nd_opt.step()
 
