@@ -2,7 +2,7 @@
     "n_repeat": 100,
     "data": {
         "name": "demand",
-        "n_sample": 3000,
+        "n_sample": 1000,
         "missing_rate": 0.5,
         "mar_alpha_value": 1.0,
         "preprocess": "Identity"

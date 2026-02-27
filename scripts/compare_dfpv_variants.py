@@ -22,8 +22,9 @@ from src.data.ate import generate_test_data_ate
 
 DEFAULT_CONFIGS = {
     "dfpv": Path("configs/dfpv_mar_baseline.json"),
-    "dfpv_mar_modified": Path("configs/dfpv_mar_modified.json"),
+    # "dfpv_mar_modified": Path("configs/dfpv_mar_modified.json"),
     "dfpv_mar_naive": Path("configs/dfpv_mar_naive.json"),
+    "dfpv_mar_modified_new": Path("configs/dfpv_mar_modified_new.json"),
 }
 
 
@@ -101,6 +102,7 @@ def _plot_bias_distribution(
         "Modified DFPV": "#B221E2",
         "Naive DFPV": "#DD8452",
         "Oracle DFPV": "#55A868",
+        "Modified DFPV New": "#E60A48",
     }
 
     plt.style.use("ggplot")
@@ -135,8 +137,9 @@ def parse_args() -> argparse.Namespace:
         description="Run and compare DFPV variants: dfpv, dfpv_mar_modified, dfpv_mar_naive"
     )
     parser.add_argument("--dfpv-config", type=Path, default=DEFAULT_CONFIGS["dfpv"])
-    parser.add_argument("--mar-modified-config", type=Path, default=DEFAULT_CONFIGS["dfpv_mar_modified"])
+    # parser.add_argument("--mar-modified-config", type=Path, default=DEFAULT_CONFIGS["dfpv_mar_modified"])
     parser.add_argument("--mar-naive-config", type=Path, default=DEFAULT_CONFIGS["dfpv_mar_naive"])
+    parser.add_argument("--mar-modified-new-config", type=Path, default=DEFAULT_CONFIGS["dfpv_mar_modified_new"])
     parser.add_argument("--n-repeat", type=int, default=None, help="Override n_repeat in all 3 configs")
     parser.add_argument("--num-cpus", type=int, default=1)
     parser.add_argument("--dump-root", type=Path, default=Path("dumps"))
@@ -152,20 +155,23 @@ def main() -> None:
 
     scenario_cfgs = [
         ("dfpv", args.dfpv_config),
-        ("dfpv_mar_modified", args.mar_modified_config),
+        # ("dfpv_mar_modified", args.mar_modified_config),
         ("dfpv_mar_naive", args.mar_naive_config),
+        ("dfpv_mar_modified_new", args.mar_modified_new_config)
     ]
 
     summary_rows: List[Tuple[str, float, float, int, str, str]] = []
     scenario_notes = {
         "dfpv": "oracle_full_observed",
-        "dfpv_mar_modified": "mar_method",
+        # "dfpv_mar_modified": "mar_method",
         "dfpv_mar_naive": "mar_complete_case",
+        "dfpv_mar_modified_new": "mar_method_new"
     }
     scenario_labels = {
         "dfpv": "Oracle DFPV",
-        "dfpv_mar_modified": "Modified DFPV",
+        # "dfpv_mar_modified": "Modified DFPV",
         "dfpv_mar_naive": "Naive DFPV",
+        "dfpv_mar_modified_new": "Modified DFPV New"
     }
     biases_by_label: Dict[str, np.ndarray] = {}
 

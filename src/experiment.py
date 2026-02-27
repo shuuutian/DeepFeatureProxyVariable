@@ -11,6 +11,7 @@ from src.utils import grid_search_dict
 
 from src.models.DFPV.trainer import dfpv_experiments, dfpv_experiments_mar_naive
 from src.models.DFPV.trainer_mar import dfpv_experiments_mar_modified
+from src.models.DFPV.trainer_mar_updated import dfpv_experiments_mar_modified_new
 from src.models.PMMR.model import pmmr_experiments
 from src.models.CEVAE.trainer import cevae_experiments
 
@@ -27,6 +28,8 @@ def get_run_func(mdl_name: str):
         return dfpv_experiments_mar_naive
     elif mdl_name == "dfpv_mar_modified":
         return dfpv_experiments_mar_modified
+    elif mdl_name == "dfpv_mar_modified_new":
+        return dfpv_experiments_mar_modified_new
     elif mdl_name == "pmmr":
         return pmmr_experiments
     elif mdl_name == "cevae":
@@ -65,7 +68,7 @@ def experiments(configs: Dict[str, Any],
         logger.critical(f"{dump_name} ended")
 
 if __name__ == "__main__":
-    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified.json")
+    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified_new.json")
     with config_path.open("r") as f:
         config = json.load(f)
 
@@ -76,4 +79,4 @@ if __name__ == "__main__":
     )
     os.mkdir(test_dump_dir)
 
-    experiments(config, test_dump_dir, num_cpus=1, num_gpu=None)
+    experiments(config, test_dump_dir, num_cpus=10, num_gpu=None)
