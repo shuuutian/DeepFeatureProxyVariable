@@ -3,8 +3,8 @@
     "data": {
         "name": "demand",
         "n_sample": 1000,
-        "missing_rate": 0.5,
-        "mar_alpha_value": 1.6,
+        "missing_rate": 0.3,
+        "mar_alpha_value": 1.0,
         "preprocess": "Identity"
     },
     "model": {
