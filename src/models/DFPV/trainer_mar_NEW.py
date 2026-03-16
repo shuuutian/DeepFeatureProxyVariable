@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from src.models.DFPV.nn_structure import build_extractor
-from src.models.DFPV.model_mar import DFPVModelMAR
+from src.models.DFPV.model_mar_NEW import DFPVModelMAR
 from src.models.DFPV.nuisance_models import NuisanceModels
 from src.models.DFPV.dr_utils import (
     construct_L_plus,
@@ -185,6 +185,7 @@ class DFPVTrainerMAR:
         # Summary stats for log file and optional console
         e_np = self.diagnostic_e_hat.cpu().numpy().flatten()
         m_np = self.diagnostic_m_hat.cpu().numpy()
+        delta_np = train_data_t.delta_w.cpu().numpy().flatten()
         ess = compute_effective_sample_size(
             self.diagnostic_e_hat.squeeze(1),
             train_data_t.delta_w,
@@ -210,6 +211,17 @@ class DFPVTrainerMAR:
         )
         mdl.fit_t(train_data_t, phi_dr_full, self.lam1, self.lam2)
 
+        # Compute psi_w = ψ_W(W) for observed cases (target for m_hat)
+        obs_mask = delta_np == 1
+        obs_mask_t = torch.from_numpy(obs_mask).to(device=train_data_t.outcome_proxy.device)
+        with torch.no_grad():
+            psi_w_obs = self.outcome_proxy_net(
+                train_data_t.outcome_proxy[obs_mask_t]
+            ).cpu().numpy()  # (n_obs, d_W)
+        stage2_pred_np = mdl.diag_stage2_pred.cpu().numpy().flatten()
+        Y_np = train_data_t.outcome.cpu().numpy().flatten()
+        stage2_resid_np = Y_np - stage2_pred_np
+
         # Post-fit diagnostics: phi_DR scale, mean_mu_hat, stage1/stage2 weight norms
         phi_np = phi_dr_full.cpu().numpy()
         summary_lines.append(
@@ -221,6 +233,31 @@ class DFPVTrainerMAR:
                 float(phi_np.max()),
                 float(np.abs(phi_np).max()),
             )
+        )
+        # Diagnostic 3: IPW correction = phi_DR - m_hat (= (delta/e)*( psi_w - m_hat ))
+        # For delta=0 this is identically 0; for delta=1 it equals (1/e)*(psi_w - m_hat).
+        ipw_corr_np = phi_np - m_np  # (n, d_W)
+        summary_lines.append(
+            "Diagnostic ipw_correction (phi_DR-m_hat): mean=%.4f std=%.4f max_abs=%.4f"
+            % (float(ipw_corr_np.mean()), float(ipw_corr_np.std()), float(np.abs(ipw_corr_np).max()))
+        )
+        # Diagnostic 2: psi_w - m_hat for observed cases = e_hat * ipw_correction (delta=1 only)
+        psi_w_resid_np = e_np[obs_mask, np.newaxis] * ipw_corr_np[obs_mask]  # (n_obs, d_W)
+        summary_lines.append(
+            "Diagnostic psi_w_resid (delta=1): mean=%.4f std=%.4f max_abs=%.4f n_obs=%d"
+            % (
+                float(psi_w_resid_np.mean()),
+                float(psi_w_resid_np.std()),
+                float(np.abs(psi_w_resid_np).max()),
+                int(obs_mask.sum()),
+            )
+        )
+        # Stage1 mean comparison: E[phi_DR] vs E[psi_W(W)|delta=1]
+        phi_dr_mean = phi_np.mean(axis=0)
+        psi_w_mean = psi_w_obs.mean(axis=0)
+        summary_lines.append(
+            "Diagnostic Stage1 mean: phi_DR_mean=%.4f psi_w_obs_mean=%.4f diff=%.4f"
+            % (float(phi_dr_mean.mean()), float(psi_w_mean.mean()), float((phi_dr_mean - psi_w_mean).mean()))
         )
         mmu = mdl.mean_mu_hat.cpu().numpy().flatten()
         summary_lines.append(
@@ -237,26 +274,60 @@ class DFPVTrainerMAR:
             "Diagnostic stage2_weight: l2_norm=%.4f"
             % (float(np.sqrt(np.sum(w2 ** 2))),)
         )
+        # Blackbox 1: stage1_feature column stats — explains why stage1_weight can be large
+        # min/mean/max are computed over non-zero-std columns only (zero-std = intercept products)
+        summary_lines.append(
+            "Diagnostic stage1_feat col_std (non-zero): min=%.4f mean=%.4f max=%.4f n_zero=%d | col_mean: min=%.4f max=%.4f"
+            % (
+                mdl.diag_s1feat_col_std_min, mdl.diag_s1feat_col_std_mean, mdl.diag_s1feat_col_std_max,
+                mdl.diag_s1feat_n_zero_cols,
+                mdl.diag_s1feat_col_mean_min, mdl.diag_s1feat_col_mean_max,
+            )
+        )
+        # Blackbox 2: mu_hat per-sample distribution (not just its mean across d_W)
+        summary_lines.append(
+            "Diagnostic mu_hat per-sample: std=%.4f min=%.4f max=%.4f"
+            % (mdl.diag_mu_hat_std, mdl.diag_mu_hat_min, mdl.diag_mu_hat_max)
+        )
+        # Blackbox 3: upper-bound on prediction magnitude = ||mean_mu_hat|| x ||stage2_weight||
+        mmu_norm = float(np.sqrt(np.sum(mmu ** 2)))
+        w2_norm = float(np.sqrt(np.sum(w2 ** 2)))
+        summary_lines.append(
+            "Diagnostic pred_scale_bound: ||mean_mu_hat||=%.4f x ||stage2_w||=%.4f => %.4f"
+            % (mmu_norm, w2_norm, mmu_norm * w2_norm)
+        )
 
         if diagnostic_save_dir is not None:
             diagnostic_save_dir = Path(diagnostic_save_dir)
             diagnostic_save_dir.mkdir(parents=True, exist_ok=True)
-            # Full per-sample CSV: index, delta_w, e_hat, m_hat_1..d_w, phi_dr_1..d_w
+            # Per-sample CSV: Stage1 (e_hat, m_hat, psi_w, diffs) and Stage2 (resid)
             d_w = phi_dr_full.shape[1]
+            e_diff_np = delta_np - e_np
+            # psi_w_all: (n, d_W) — NaN for delta_w=0
+            psi_w_all = np.full((len(delta_np), d_w), np.nan)
+            psi_w_all[obs_mask] = psi_w_obs
+            # m_abs_diff: (n,) — sum_j |psi_w_j - m_hat_j|, NaN for delta_w=0
+            m_abs_diff_np = np.full(len(delta_np), np.nan)
+            m_abs_diff_np[obs_mask] = np.abs(psi_w_obs - m_np[obs_mask]).sum(axis=1)
             csv_path = diagnostic_save_dir / "diagnostic_nuisance.csv"
-            delta_np = train_data_t.delta_w.cpu().numpy().flatten()
             with csv_path.open("w", newline="") as f:
                 writer = csv.writer(f)
                 header = (
-                    ["sample_idx", "delta_w", "e_hat"]
+                    ["sample_idx", "delta_w", "e_hat", "e_diff"]
                     + [f"m_hat_{j}" for j in range(d_w)]
-                    + [f"phi_dr_{j}" for j in range(d_w)]
+                    + [f"psi_w_{j}" for j in range(d_w)]
+                    + ["m_abs_diff", "stage2_resid"]
                 )
                 writer.writerow(header)
                 for i in range(len(delta_np)):
-                    row = [i, float(delta_np[i]), float(e_np[i])]
+                    row = [i, float(delta_np[i]), float(e_np[i]), float(e_diff_np[i])]
                     row.extend(float(x) for x in m_np[i])
-                    row.extend(float(x) for x in phi_np[i])
+                    row.extend(
+                        "" if np.isnan(psi_w_all[i, j]) else float(psi_w_all[i, j])
+                        for j in range(d_w)
+                    )
+                    row.append("" if np.isnan(m_abs_diff_np[i]) else float(m_abs_diff_np[i]))
+                    row.append(float(stage2_resid_np[i]))
                     writer.writerow(row)
             # Summary log file (no console dependency; safe in parallel)
             log_path = diagnostic_save_dir / "diagnostic_summary.log"
@@ -719,7 +790,7 @@ class DFPVTrainerMAR:
         )
 
 
-def dfpv_experiments_mar_modified(
+def dfpv_experiments_mar_modified_NEW(
     data_config: Dict[str, Any],
     model_param: Dict[str, Any],
     one_mdl_dump_dir: Path,

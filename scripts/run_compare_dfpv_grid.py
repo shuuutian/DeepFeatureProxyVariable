@@ -9,7 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 BASELINE_CFG = REPO_ROOT / "configs" / "dfpv_mar_baseline.json"
-MODIFIED_CFG = REPO_ROOT / "configs" / "dfpv_mar_modified.json"
+MODIFIED_CFG = REPO_ROOT / "configs" / "dfpv_mar_modified_NEW.json"
 NAIVE_CFG = REPO_ROOT / "configs" / "dfpv_mar_naive.json"
 
 # Grid values

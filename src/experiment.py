@@ -11,6 +11,7 @@ from src.utils import grid_search_dict
 
 from src.models.DFPV.trainer import dfpv_experiments, dfpv_experiments_mar_naive
 from src.models.DFPV.trainer_mar import dfpv_experiments_mar_modified
+from src.models.DFPV.trainer_mar_NEW import dfpv_experiments_mar_modified_NEW
 from src.models.PMMR.model import pmmr_experiments
 from src.models.CEVAE.trainer import cevae_experiments
 
@@ -27,6 +28,8 @@ def get_run_func(mdl_name: str):
         return dfpv_experiments_mar_naive
     elif mdl_name == "dfpv_mar_modified":
         return dfpv_experiments_mar_modified
+    elif mdl_name == "dfpv_mar_modified_NEW":
+        return dfpv_experiments_mar_modified_NEW
     elif mdl_name == "pmmr":
         return pmmr_experiments
     elif mdl_name == "cevae":
@@ -42,6 +45,7 @@ def experiments(configs: Dict[str, Any],
     data_config = configs["data"]
     model_config = configs["model"]
     n_repeat: int = configs["n_repeat"]
+    seeds_list = configs.get("seeds_list", range(n_repeat))
 
     if num_cpus <= 1 and n_repeat <= 1:
         verbose: int = 2
@@ -58,14 +62,15 @@ def experiments(configs: Dict[str, Any],
                 os.mkdir(one_mdl_dump_dir)
             else:
                 one_mdl_dump_dir = one_dump_dir
-            tasks = [delayed(run_func)(env_param, mdl_param, one_mdl_dump_dir, idx, verbose) for idx in range(n_repeat)]
+
+            tasks = [delayed(run_func)(env_param, mdl_param, one_mdl_dump_dir, seed, verbose) for seed in seeds_list]
             res = Parallel(n_jobs=num_cpus)(tasks)
             print(res)
             np.savetxt(one_mdl_dump_dir.joinpath("result.csv"), np.array(res))
         logger.critical(f"{dump_name} ended")
 
 if __name__ == "__main__":
-    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified.json")
+    config_path = Path.cwd().joinpath("configs/dfpv_mar_modified_goodbad.json")
     with config_path.open("r") as f:
         config = json.load(f)
 
