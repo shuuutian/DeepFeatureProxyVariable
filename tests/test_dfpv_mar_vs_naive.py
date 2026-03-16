@@ -15,7 +15,7 @@ from src.models.DFPV.trainer_mar import DFPVTrainerMAR
 def run_naive_vs_mar(
     random_seed: int = 42,
     n_sample: int = 10000,
-    missing_rate: float = 0.5,
+    mar_threshold: float = 0.0,
 ) -> tuple[float, float]:
     """
     Compare, on the synthetic demand environment:
@@ -34,7 +34,7 @@ def run_naive_vs_mar(
     data_config = {
         "name": "demand",
         "n_sample": n_sample,
-        "missing_rate": missing_rate,
+        "mar_threshold": mar_threshold,
         "preprocess": "Identity",
     }
 

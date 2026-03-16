@@ -2,3 +2,4 @@
 .idea
 dumps/
 configs/
+*.zip

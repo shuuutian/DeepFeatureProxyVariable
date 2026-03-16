@@ -803,7 +803,7 @@ def dfpv_experiments_mar_modified_NEW(
     DFPVTrainerMAR, and the MAR predict signature.
 
     Args:
-        data_config:      dataset config dict (must contain "name" and "missing_rate")
+        data_config:      dataset config dict (must contain "name" and optionally "mar_threshold")
         model_param:      trainer hyperparameter dict
         one_mdl_dump_dir: directory to save predictions
         random_seed:      controls data generation, fold creation, and torch seed

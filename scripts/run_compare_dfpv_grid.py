@@ -14,7 +14,7 @@ NAIVE_CFG = REPO_ROOT / "configs" / "dfpv_mar_naive.json"
 
 # Grid values
 N_SAMPLES = [1000, 3000, 5000]
-MISSING_RATES = [0.3, 0.5, 0.7]
+MAR_THRESHOLDS = [-0.5, 0.0, 0.5]
 MAR_ALPHAS = [0.6, 1.0, 1.6]
 
 TMP_DIR = REPO_ROOT / "configs" / "grid_tmp"
@@ -36,10 +36,10 @@ def main() -> None:
     modified_base = _load_json(MODIFIED_CFG)
     naive_base = _load_json(NAIVE_CFG)
 
-    for n_sample, missing_rate, mar_alpha in itertools.product(
-        N_SAMPLES, MISSING_RATES, MAR_ALPHAS
+    for n_sample, mar_threshold, mar_alpha in itertools.product(
+        N_SAMPLES, MAR_THRESHOLDS, MAR_ALPHAS
     ):
-        suffix = f"n{n_sample}_mr{missing_rate}_a{mar_alpha}".replace(".", "p")
+        suffix = f"n{n_sample}_th{mar_threshold}_a{mar_alpha}".replace(".", "p")
 
         baseline_cfg_path = TMP_DIR / f"dfpv_baseline_{suffix}.json"
         modified_cfg_path = TMP_DIR / f"dfpv_mar_modified_{suffix}.json"
@@ -57,7 +57,7 @@ def main() -> None:
 
         # Set MAR-specific parameters for the MAR-based methods
         for cfg in (modified_cfg, naive_cfg):
-            cfg["data"]["missing_rate"] = missing_rate
+            cfg["data"]["mar_threshold"] = mar_threshold
             cfg["data"]["mar_alpha_value"] = mar_alpha
 
         _save_json(baseline_cfg, baseline_cfg_path)
@@ -68,7 +68,7 @@ def main() -> None:
 
         print(
             f"Running grid point: n_sample={n_sample}, "
-            f"missing_rate={missing_rate}, mar_alpha_value={mar_alpha}"
+            f"mar_threshold={mar_threshold}, mar_alpha_value={mar_alpha}"
         )
 
         subprocess.run(

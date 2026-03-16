@@ -231,35 +231,24 @@ $$
 
 The default `mar_alpha_value` is **1.6** (configurable). All dimensions of $L^+$
 contribute equally to the missingness score. Larger values of `mar_alpha_value`
-produce more heterogeneous missingness probabilities (stronger MAR dependence on
-observed variables).
+spread the score distribution further, producing stronger separation between
+observed and missing groups.
 
-**Step 4 — Calibrate intercept $\alpha_0$ via binary search:**
-
-Solve for $\alpha_0$ such that the marginal missing rate matches the target:
+**Step 4 — Deterministic threshold:**
 
 $$
-\frac{1}{n}\sum_{i=1}^{n} \sigma(\alpha_0 + s_i) = \texttt{missing\_rate}
+\delta_{W,i} = \begin{cases}1 & \text{if } s_i \leq \texttt{mar\_threshold} \\
+0 & \text{if } s_i > \texttt{mar\_threshold}\end{cases}
 $$
 
-where $\sigma(\cdot)$ is the logistic sigmoid.  A 60-iteration bisection over
-$[-20, 20]$ is used — this converges to machine precision.
+The default `mar_threshold` is **0.0**. Since $\tilde{L}^+$ is zero-mean, a
+threshold of 0 produces roughly 50% missingness. Increasing the threshold
+observes more data; decreasing it observes less.
 
-**Step 5 — Sample missingness:**
+This is fully deterministic given the data — no additional randomness is
+introduced beyond the base data generation.
 
-$$
-\Pr(\delta_{W,i} = 0 \mid L^+_i) = \sigma(\alpha_0 + s_i)
-$$
-
-$$
-\delta_{W,i} = \begin{cases}1 & \text{if } U_i \geq \sigma(\alpha_0 + s_i) \\
-0 & \text{otherwise}\end{cases}, \qquad U_i \sim \text{Uniform}(0,1)
-$$
-
-The RNG for the uniform draws uses `rand_seed + 1000` (separate from the base data
-seed) to ensure missingness is independent of the data-generation randomness.
-
-**Step 6 — Mask $W$ for missing rows:**
+**Step 5 — Mask $W$ for missing rows:**
 
 $$
 W_i^{\text{MAR}} = \begin{cases} W_i & \text{if } \delta_{W,i} = 1 \\ 0 & \text{if } \delta_{W,i} = 0 \end{cases}
@@ -271,16 +260,21 @@ entries are genuine observations.
 ### 3.3 Key properties of the MAR mechanism
 
 1. **MAR, not MCAR:** Missingness depends on observed $(A, Z, Y)$ through the
-   logistic model. It does **not** depend on $W$ itself (conditional on $L^+$),
+   linear score. It does **not** depend on $W$ itself (conditional on $L^+$),
    satisfying the MAR condition:
    $\delta_W \perp\!\!\!\perp W \mid A, Z, Y$.
 
-2. **Controllable missing rate:** The `missing_rate` parameter (default 0.3) sets
-   the marginal proportion of missing outcome-proxy values.
+2. **Deterministic and reproducible:** Given the same base data, the missingness
+   pattern is fully determined by `mar_threshold` and `mar_alpha_value` — no
+   additional random sampling is involved.
 
-3. **Controllable MAR strength:** `mar_alpha_value` (default 1.6) controls how
-   heterogeneous the per-observation missing probabilities are. At 0 the mechanism
-   degenerates to MCAR; at large values the probabilities spread toward 0 and 1.
+3. **Controllable via threshold:** `mar_threshold` (default 0.0) shifts the
+   cutoff on the score, directly controlling the fraction of missing data.
+
+4. **Controllable MAR strength:** `mar_alpha_value` (default 1.6) controls the
+   spread of the score distribution. At 0 all scores equal 0 and the threshold
+   produces all-observed or all-missing; at large values the scores spread out,
+   creating stronger dependence on observed variables.
 
 ### 3.4 Returned data object
 
@@ -344,9 +338,9 @@ through the 2SLS), while Stage-1 treats $\psi_{\theta_W}$ targets as detached.
 | Parameter | Location | Default | Description |
 |-----------|----------|---------|-------------|
 | `n_sample` | `data_config` | — | Number of training observations |
-| `missing_rate` | `data_config` | 0.3 | Target marginal fraction of missing $W$ |
-| `mar_alpha_value` | `data_config` | 1.6 | Logistic coefficient magnitude (MAR strength) |
-| `seed` / `rand_seed` | function arg | 42 | Base RNG seed; missingness uses `seed + 1000` |
+| `mar_threshold` | `data_config` | 0.0 | Score threshold for missingness (higher = more observed) |
+| `mar_alpha_value` | `data_config` | 1.6 | Linear coefficient magnitude (MAR strength / score spread) |
+| `seed` / `rand_seed` | function arg | 42 | Base RNG seed for data generation |
 
 ---
 
