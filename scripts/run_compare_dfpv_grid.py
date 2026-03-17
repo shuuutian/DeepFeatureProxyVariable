@@ -13,9 +13,9 @@ MODIFIED_CFG = REPO_ROOT / "configs" / "dfpv_mar_modified_NEW.json"
 NAIVE_CFG = REPO_ROOT / "configs" / "dfpv_mar_naive.json"
 
 # Grid values
-N_SAMPLES = [1000, 3000, 5000]
-MAR_THRESHOLDS = [-0.5, 0.0, 0.5]
-MAR_ALPHAS = [0.6, 1.0, 1.6]
+N_SAMPLES = [1000, 3000]
+MAR_THRESHOLDS = [-1, -1.5, -2.5]
+MAR_ALPHAS = [1.0]
 
 TMP_DIR = REPO_ROOT / "configs" / "grid_tmp"
 
